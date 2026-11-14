@@ -1,30 +1,10 @@
 /*
- * Copyright (c) 2016, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2016-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "mt19937-64.h"
@@ -47,6 +27,7 @@ struct {
     unsigned long keys;             /* Number of keys processed. */
     unsigned long expires;          /* Number of keys with an expire. */
     unsigned long already_expired;  /* Number of keys already expired. */
+    unsigned long subexpires;        /* Number of keys with subexpires */
     int doing;                      /* The state while reading the RDB. */
     int error_set;                  /* True if error is populated. */
     char error[1024];
@@ -98,7 +79,28 @@ char *rdb_type_string[] = {
     "hash-listpack",
     "zset-listpack",
     "quicklist-v2",
+    "stream-v2",
     "set-listpack",
+    "stream-v3",
+    "hash-hashtable-md-pre-release",
+    "hash-listpack-md-pre-release",
+    "hash-hashtable-md",
+    "hash-listpack-md",
+    "stream-v4",
+    "stream-v5",
+    "array",
+    "hash-tmpl-lp",
+    "hash-tmpl-lp-ref",
+    "hash-tmpl-array",
+    "hash-tmpl-array-ref",
+    "bitmap",
+    "set-listpack-md",
+    "set-hashtable-md",
+#ifdef ENABLE_GCRA
+    "gcra",
+#else
+    "unused",
+#endif
 };
 
 /* Show a few stats collected into 'rdbstate' */
@@ -106,6 +108,7 @@ void rdbShowGenericInfo(void) {
     printf("[info] %lu keys read\n", rdbstate.keys);
     printf("[info] %lu expires\n", rdbstate.expires);
     printf("[info] %lu already expired\n", rdbstate.already_expired);
+    printf("[info] %lu subexpires\n", rdbstate.subexpires);
 }
 
 /* Called on RDB errors. Provides details about the RDB and the offset
@@ -255,6 +258,24 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
             /* IDLE: LRU idle time. */
             if (rdbLoadLen(&rdb,NULL) == RDB_LENERR) goto eoferr;
             continue; /* Read next opcode. */
+        } else if (type == RDB_OPCODE_KEY_META) {
+            /* KEY_META: Module metadata for the next key. */
+            uint64_t numClasses;
+            if ((numClasses = rdbLoadLen(&rdb,NULL)) == RDB_LENERR) goto eoferr;
+            /* Skip metadata by reading and discarding each class's data */
+            for (uint64_t i = 0; i < numClasses; i++) {
+                /* Read 4-byte CLASS_SPEC */
+                uint32_t classSpec;
+                if (rioRead(&rdb, &classSpec, 4) == 0) goto eoferr;
+                /* Skip module value using rdbLoadCheckModuleValue */
+                robj *o = rdbLoadCheckModuleValue(&rdb, "metadata", 1);
+                if (o == NULL) goto eoferr;
+                decrRefCount(o);
+            }
+            continue; /* Read next opcode. */
+        } else if (type == RDB_OPCODE_KEY_NOEVICT) {
+            /* Payload-less NO-EVICT flag for the next key. */
+            continue; /* Read next opcode. */
         } else if (type == RDB_OPCODE_EOF) {
             /* EOF: End of file, exit the main loop. */
             break;
@@ -320,7 +341,7 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
             moduleTypeNameByID(name,moduleid);
             rdbCheckInfo("MODULE AUX for: %s", name);
 
-            robj *o = rdbLoadCheckModuleValue(&rdb,name);
+            robj *o = rdbLoadCheckModuleValue(&rdb, name, 0);
             decrRefCount(o);
             continue; /* Read type again. */
         } else if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
@@ -335,6 +356,14 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
                 goto err;
             }
             continue;
+        } else if (type == RDB_OPCODE_HASH_TEMPLATE) {
+            /* Hash template registry. Must be loaded so that later
+             * template-referencing keys can resolve their template. */
+            if (rdbLoadHashTemplate(&rdb) != C_OK) {
+                rdbCheckError("Failed loading hash templates");
+                goto err;
+            }
+            continue; /* Read type again. */
         } else {
             if (!rdbIsObjectType(type)) {
                 rdbCheckError("Invalid object type: %d", type);
@@ -350,11 +379,17 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
         rdbstate.keys++;
         /* Read value */
         rdbstate.doing = RDB_CHECK_DOING_READ_OBJECT_VALUE;
-        if ((val = rdbLoadObject(type,&rdb,key->ptr,selected_dbid,NULL)) == NULL) goto eoferr;
+        if ((val = rdbLoadObject(type,&rdb,key->ptr,selected_dbid,rdbver,NULL)) == NULL)
+            goto eoferr;
         /* Check if the key already expired. */
         if (expiretime != -1 && expiretime < now)
             rdbstate.already_expired++;
         if (expiretime != -1) rdbstate.expires++;
+        /* If hash with HFEs, or set with member expirations, then need to count it */
+        if (((val->type == OBJ_HASH) && (hashTypeGetMinExpire(val, 1) != EB_EXPIRE_TIME_INVALID)) ||
+            ((val->type == OBJ_SET) && (setTypeGetMinExpire(val, 1) != EB_EXPIRE_TIME_INVALID)))
+            rdbstate.subexpires++;
+
         rdbstate.key = NULL;
         decrRefCount(key);
         decrRefCount(val);
@@ -379,6 +414,7 @@ int redis_check_rdb(char *rdbfilename, FILE *fp) {
     }
 
     if (closefile) fclose(fp);
+    rdbClearHashTemplates();
     stopLoading(1);
     return 0;
 
@@ -390,6 +426,7 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
     }
 err:
     if (closefile) fclose(fp);
+    rdbClearHashTemplates();
     stopLoading(0);
     return 1;
 }
@@ -427,6 +464,9 @@ int redis_check_rdb_main(int argc, char **argv, FILE *fp) {
      * an already initialized Redis instance, check if we really need to. */
     if (shared.integers[0] == NULL)
         createSharedObjects();
+
+    server.main_thread_id = pthread_self(); /* Needed for hashtemplate keys free path */
+    hashTemplatesInit();
     server.loading_process_events_interval_bytes = 0;
     server.sanitize_dump_payload = SANITIZE_DUMP_YES;
     rdbCheckMode = 1;

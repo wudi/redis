@@ -1,6 +1,10 @@
 # Redis Makefile
-# Copyright (C) 2009 Salvatore Sanfilippo <antirez at gmail dot com>
-# This file is released under the BSD license, see the COPYING file
+# Copyright (c) 2011-Present, Redis Ltd.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
 #
 # The Makefile composes the final FINAL_CFLAGS and FINAL_LDFLAGS using
 # what is needed for Redis plus the standard CFLAGS and LDFLAGS passed.
@@ -16,16 +20,24 @@ release_hdr := $(shell sh -c './mkreleasehdr.sh')
 uname_S := $(shell sh -c 'uname -s 2>/dev/null || echo not')
 uname_M := $(shell sh -c 'uname -m 2>/dev/null || echo not')
 CLANG := $(findstring clang,$(shell sh -c '$(CC) --version | head -1'))
+
+# Optimization flags. To override, the OPTIMIZATION variable can be passed, but
+# some automatic defaults are added to it. To specify optimization flags
+# explicitly without any defaults added, pass the OPT variable instead.
 OPTIMIZATION?=-O3
+ENABLE_LTO?=
 ifeq ($(OPTIMIZATION),-O3)
 	ifeq (clang,$(CLANG))
-		REDIS_CFLAGS+=-flto
+		ENABLE_LTO=-flto
 	else
-		REDIS_CFLAGS+=-flto=auto
+		ENABLE_LTO=-flto=auto -ffat-lto-objects
 	endif
-	REDIS_LDFLAGS+=-O3 -flto
+	OPTIMIZATION+=$(ENABLE_LTO)
 endif
-DEPENDENCY_TARGETS=hiredis linenoise lua hdr_histogram fpconv
+ifneq ($(OPTIMIZATION),-O0)
+	OPTIMIZATION+=-fno-omit-frame-pointer
+endif
+DEPENDENCY_TARGETS=hiredis linenoise lua hdr_histogram fpconv xxhash tre croaring
 NODEPS:=clean distclean
 
 # Default settings
@@ -43,6 +55,7 @@ endif
 WARN=-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes
 OPT=$(OPTIMIZATION)
 
+SKIP_VEC_SETS?=no
 # Detect if the compiler supports C11 _Atomic.
 # NUMBER_SIGN_CHAR is a workaround to support both GNU Make 4.3 and older versions.
 NUMBER_SIGN_CHAR := \#
@@ -52,6 +65,7 @@ C11_ATOMIC := $(shell sh -c 'echo "$(NUMBER_SIGN_CHAR)include <stdatomic.h>" > f
 ifeq ($(C11_ATOMIC),yes)
 	STD+=-std=gnu11
 else
+	SKIP_VEC_SETS=yes
 	STD+=-std=c99
 endif
 
@@ -107,18 +121,54 @@ ifeq ($(SANITIZER),thread)
 	CFLAGS+=-fsanitize=thread -fno-sanitize-recover=all -fno-omit-frame-pointer
 	LDFLAGS+=-fsanitize=thread
 else
+ifeq ($(SANITIZER),memory)
+ifeq (clang, $(CLANG))
+	export CXX:=clang
+	export LD:=clang
+	MALLOC=libc # MSan provides its own allocator so make sure not to use jemalloc as they clash
+	CFLAGS+=-fsanitize=memory -fsanitize-memory-track-origins=2 -fno-sanitize-recover=all -fno-omit-frame-pointer
+	LDFLAGS+=-fsanitize=memory
+else
+    $(error "MemorySanitizer needs to be compiled and linked with clang. Please use CC=clang")
+endif
+else
     $(error "unknown sanitizer=${SANITIZER}")
 endif
 endif
 endif
+endif
+endif
+
+# Special case of forcing defrag to run even though we have no Jemlloc support
+ifeq ($(DEBUG_DEFRAG), force)
+	CFLAGS +=-DDEBUG_DEFRAG_FORCE
+else ifeq ($(DEBUG_DEFRAG), fully)
+	CFLAGS +=-DDEBUG_DEFRAG_FORCE -DDEBUG_DEFRAG_FULLY
 endif
 
 # Override default settings if possible
 -include .make-settings
 
 FINAL_CFLAGS=$(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(REDIS_CFLAGS)
-FINAL_LDFLAGS=$(LDFLAGS) $(REDIS_LDFLAGS) $(DEBUG)
+FINAL_LDFLAGS=$(LDFLAGS) $(OPT) $(REDIS_LDFLAGS) $(DEBUG)
 FINAL_LIBS=-lm
+
+# Replication compression (opt-in via BUILD_COMPRESSION=yes). When enabled the
+# replication stream can be compressed with libzstd; when disabled libzstd is
+# not required to build Redis and the compression code compiles to no-ops.
+ifeq ($(BUILD_COMPRESSION),yes)
+	# Detect libzstd via pkg-config, fall back to -lzstd
+	LIBZSTD_PKGCONFIG := $(shell $(PKG_CONFIG) --exists libzstd && echo $$?)
+	ifeq ($(LIBZSTD_PKGCONFIG),0)
+		LIBZSTD_CFLAGS=$(shell $(PKG_CONFIG) --cflags libzstd)
+		LIBZSTD_LIBS=$(shell $(PKG_CONFIG) --libs libzstd)
+	else
+		LIBZSTD_CFLAGS=
+		LIBZSTD_LIBS=-lzstd
+	endif
+	FINAL_CFLAGS+=-DUSE_COMPRESSION=1 $(LIBZSTD_CFLAGS)
+	FINAL_LIBS+=$(LIBZSTD_LIBS)
+endif
 DEBUG=-g -ggdb
 
 # Linux ARM32 needs -latomic at linking time
@@ -226,7 +276,7 @@ ifdef OPENSSL_PREFIX
 endif
 
 # Include paths to dependencies
-FINAL_CFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram -I../deps/fpconv
+FINAL_CFLAGS+= -I../deps/hiredis -I../deps/linenoise -I../deps/lua/src -I../deps/hdr_histogram -I../deps/fpconv -I../deps/xxhash -I../deps/croaring/include
 
 # Determine systemd support and/or build preference (defaulting to auto-detection)
 BUILD_WITH_SYSTEMD=no
@@ -306,6 +356,12 @@ ifeq ($(BUILD_TLS),module)
 	TLS_MODULE_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS) -DBUILD_TLS_MODULE=$(BUILD_MODULE)
 endif
 
+ifneq ($(SKIP_VEC_SETS),yes)
+	vpath %.c ../modules/vector-sets
+	REDIS_VEC_SETS_OBJ=hnsw.o vset.o vset_config.o
+	FINAL_CFLAGS+=-DINCLUDE_VEC_SETS=1
+endif
+
 ifndef V
     define MAKE_INSTALL
         @printf '    %b %b\n' $(LINKCOLOR)INSTALL$(ENDCOLOR) $(BINCOLOR)$(1)$(ENDCOLOR) 1>&2
@@ -319,6 +375,18 @@ endif
 
 REDIS_CC=$(QUIET_CC)$(CC) $(FINAL_CFLAGS)
 REDIS_LD=$(QUIET_LINK)$(CC) $(FINAL_LDFLAGS)
+# GCC's LTO linker invokes make and needs the parent's jobserver descriptors.
+# A '+' recipe prefix passes them through, but must not execute the linker in
+# dry-run, touch or query mode. Short flags occupy the first MAKEFLAGS word.
+REDIS_MAKE_SHORT_FLAGS = $(firstword -$(MAKEFLAGS))
+
+REDIS_LD_RECURSIVE = +
+ifneq (,$(or \
+    $(findstring n,$(REDIS_MAKE_SHORT_FLAGS)), \
+    $(findstring t,$(REDIS_MAKE_SHORT_FLAGS)), \
+    $(findstring q,$(REDIS_MAKE_SHORT_FLAGS))))
+REDIS_LD_RECURSIVE =
+endif
 REDIS_INSTALL=$(QUIET_INSTALL)$(INSTALL)
 
 CCCOLOR="\033[34m"
@@ -345,16 +413,16 @@ endif
 
 REDIS_SERVER_NAME=redis-server$(PROG_SUFFIX)
 REDIS_SENTINEL_NAME=redis-sentinel$(PROG_SUFFIX)
-REDIS_SERVER_OBJ=threads_mngr.o adlist.o quicklist.o ae.o anet.o dict.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o t_hash.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_legacy.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crc64.o bitops.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o
+REDIS_SERVER_OBJ=threads_mngr.o memory_prefetch.o adlist.o quicklist.o ae.o anet.o dict.o ebuckets.o eventnotifier.o iothread.o mstr.o hash_entry.o set_entry.o kvstore.o fwtree.o estore.o server.o sds.o zmalloc.o lzf_c.o lzf_d.o lzf_d_2.o pqsort.o zipmap.o sha1.o ziplist.o release.o networking.o util.o object.o db.o replication.o rdb.o t_string.o t_list.o t_set.o t_zset.o zset_btree.o t_hash.o bless.o t_array.o sparsearray.o config.o aof.o pubsub.o multi.o debug.o sort.o intset.o syncio.o cluster.o cluster_asm.o cluster_legacy.o cluster_slot_stats.o crc16.o endianconv.o slowlog.o eval.o bio.o rio.o rand.o memtest.o syscheck.o crcspeed.o crccombine.o crc64.o bitops.o bitroar.o sentinel.o notify.o setproctitle.o blocked.o hyperloglog.o latency.o sparkline.o redis-check-rdb.o redis-check-aof.o geo.o lazyfree.o module.o evict.o expire.o geohash.o geohash_helper.o childinfo.o defrag.o siphash.o rax.o t_stream.o listpack.o localtime.o lolwut.o lolwut5.o lolwut6.o lolwut8.o acl.o tracking.o socket.o tls.o sha256.o timeout.o setcpuaffinity.o monotonic.o mt19937-64.o resp_parser.o call_reply.o script_lua.o script.o functions.o function_lua.o commands.o strl.o connection.o unix.o logreqres.o keymeta.o chk.o hotkeys.o gcra.o vector.o fast_float_strtod.o client_comp.o
 REDIS_CLI_NAME=redis-cli$(PROG_SUFFIX)
-REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
+REDIS_CLI_OBJ=anet.o adlist.o dict.o redis-cli.o zmalloc.o release.o ae.o redisassert.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o cli_commands.o
 REDIS_BENCHMARK_NAME=redis-benchmark$(PROG_SUFFIX)
-REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
+REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redisassert.o release.o crcspeed.o crccombine.o crc64.o siphash.o crc16.o monotonic.o cli_common.o mt19937-64.o strl.o
 REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
-ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
+ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
 
-all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE)
+all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE) module_tests
 	@echo ""
 	@echo "Hint: It's a good idea to run 'make test' ;)"
 	@echo ""
@@ -368,12 +436,18 @@ endif
 
 .PHONY: all
 
+module_tests: $(REDIS_SERVER_NAME)
+	$(MAKE) -C ../tests/modules
+
+.PHONY: module_tests
+
 persist-settings: distclean
 	echo STD=$(STD) >> .make-settings
 	echo WARN=$(WARN) >> .make-settings
 	echo OPT=$(OPT) >> .make-settings
 	echo MALLOC=$(MALLOC) >> .make-settings
 	echo BUILD_TLS=$(BUILD_TLS) >> .make-settings
+	echo BUILD_COMPRESSION=$(BUILD_COMPRESSION) >> .make-settings
 	echo USE_SYSTEMD=$(USE_SYSTEMD) >> .make-settings
 	echo CFLAGS=$(CFLAGS) >> .make-settings
 	echo LDFLAGS=$(LDFLAGS) >> .make-settings
@@ -381,7 +455,7 @@ persist-settings: distclean
 	echo REDIS_LDFLAGS=$(REDIS_LDFLAGS) >> .make-settings
 	echo PREV_FINAL_CFLAGS=$(FINAL_CFLAGS) >> .make-settings
 	echo PREV_FINAL_LDFLAGS=$(FINAL_LDFLAGS) >> .make-settings
-	-(cd ../deps && $(MAKE) $(DEPENDENCY_TARGETS))
+	-(cd ../deps && $(MAKE) $(DEPENDENCY_TARGETS) ENABLE_LTO="$(ENABLE_LTO)")
 
 .PHONY: persist-settings
 
@@ -399,8 +473,8 @@ ifneq ($(strip $(PREV_FINAL_LDFLAGS)), $(strip $(FINAL_LDFLAGS)))
 endif
 
 # redis-server
-$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a $(FINAL_LIBS)
+$(REDIS_SERVER_NAME): $(REDIS_SERVER_OBJ) $(REDIS_VEC_SETS_OBJ)
+	$(REDIS_LD_RECURSIVE)$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/lua/src/liblua.a ../deps/hdr_histogram/libhdrhistogram.a ../deps/fpconv/libfpconv.a ../deps/xxhash/libxxhash.a ../deps/tre/libtre.a ../deps/croaring/libroaring.a $(FINAL_LIBS)
 
 # redis-sentinel
 $(REDIS_SENTINEL_NAME): $(REDIS_SERVER_NAME)
@@ -416,17 +490,17 @@ $(REDIS_CHECK_AOF_NAME): $(REDIS_SERVER_NAME)
 
 # redis-tls.so
 $(TLS_MODULE_NAME): $(REDIS_SERVER_NAME)
-	$(QUIET_CC)$(CC) -o $@ tls.c -shared -fPIC $(TLS_MODULE_CFLAGS) $(TLS_CLIENT_LIBS)
+	$(REDIS_LD_RECURSIVE)$(QUIET_CC)$(CC) -o $@ tls.c -shared -fPIC $(TLS_MODULE_CFLAGS) $(TLS_CLIENT_LIBS)
 
 # redis-cli
 $(REDIS_CLI_NAME): $(REDIS_CLI_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
+	$(REDIS_LD_RECURSIVE)$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/linenoise/linenoise.o ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
 # redis-benchmark
 $(REDIS_BENCHMARK_NAME): $(REDIS_BENCHMARK_OBJ)
-	$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
+	$(REDIS_LD_RECURSIVE)$(REDIS_LD) -o $@ $^ ../deps/hiredis/libhiredis.a ../deps/hdr_histogram/libhdrhistogram.a $(FINAL_LIBS) $(TLS_CLIENT_LIBS)
 
-DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
+DEP = $(REDIS_SERVER_OBJ:%.o=%.d) $(REDIS_VEC_SETS_OBJ:%.o=%.d) $(REDIS_CLI_OBJ:%.o=%.d) $(REDIS_BENCHMARK_OBJ:%.o=%.d)
 -include $(DEP)
 
 # Because the jemalloc.h header is generated as a part of the jemalloc build,
@@ -452,6 +526,7 @@ commands.c: $(COMMANDS_DEF_FILENAME).def
 clean:
 	rm -rf $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) *.o *.gcda *.gcno *.gcov redis.info lcov-html Makefile.dep *.so
 	rm -f $(DEP)
+	-(cd ../tests/modules && $(MAKE) clean)
 
 .PHONY: clean
 
@@ -463,7 +538,7 @@ distclean: clean
 
 .PHONY: distclean
 
-test: $(REDIS_SERVER_NAME) $(REDIS_CHECK_AOF_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME)
+test: $(REDIS_SERVER_NAME) $(REDIS_CHECK_AOF_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) module_tests
 	@(cd ..; ./runtest)
 
 test-modules: $(REDIS_SERVER_NAME)
@@ -472,16 +547,18 @@ test-modules: $(REDIS_SERVER_NAME)
 test-sentinel: $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME)
 	@(cd ..; ./runtest-sentinel)
 
-test-cluster: $(REDIS_SERVER_NAME) $(REDIS_CLI_NAME)
-	@(cd ..; ./runtest-cluster)
-
 check: test
 
 lcov:
+	@lcov --version
 	$(MAKE) gcov
-	@(set -e; cd ..; ./runtest --clients 1)
-	@geninfo -o redis.info .
-	@genhtml --legend -o lcov-html redis.info
+	@(set -e; cd ..; ./runtest)
+	# geninfo_unexecuted_blocks=1 count partially executed lines as uncovered.
+	# May lower coverage but gives a strict result
+	@geninfo --rc geninfo_unexecuted_blocks=1 -o redis.info .
+	# Optimized builds can report zero function hits despite covered lines (e.g. after inlining).
+	# Keep these inconsistencies as warnings so HTML generation can finish without changing redis.info.
+	@genhtml --ignore-errors inconsistent --legend -o lcov-html redis.info
 
 .PHONY: lcov
 
@@ -492,10 +569,11 @@ bench: $(REDIS_BENCHMARK_NAME)
 	@echo ""
 	@echo "WARNING: if it fails under Linux you probably need to install libc6-dev-i386"
 	@echo ""
-	$(MAKE) CFLAGS="-m32" LDFLAGS="-m32"
+	$(MAKE) CFLAGS="-m32" LDFLAGS="-m32" SKIP_VEC_SETS="yes"
 
+# Use -fprofile-update=atomic because IO threads can update counters concurrently.
 gcov:
-	$(MAKE) REDIS_CFLAGS="-fprofile-arcs -ftest-coverage -DCOVERAGE_TEST" REDIS_LDFLAGS="-fprofile-arcs -ftest-coverage"
+	$(MAKE) REDIS_CFLAGS="-fprofile-arcs -ftest-coverage -fprofile-update=atomic -DCOVERAGE_TEST" REDIS_LDFLAGS="-fprofile-arcs -ftest-coverage"
 
 noopt:
 	$(MAKE) OPTIMIZATION="-O0"

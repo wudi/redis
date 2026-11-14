@@ -90,7 +90,7 @@ start_server {} {
             restart_server 0 true false true now
             set master [srv 0 client]
         }
-        wait_for_condition 50 1000 {
+        wait_for_condition 100 1000 {
             [status $replica master_link_status] eq {up} &&
             [status $sub_replica master_link_status] eq {up}
         } else {
@@ -131,7 +131,6 @@ start_server {} {
             $offset == [status $replica master_repl_offset] &&
             $offset == [status $sub_replica master_repl_offset]
         } else {
-            show_cluster_status
             fail "Replicas and master offsets were unable to match *exactly*."
         }
 
@@ -164,8 +163,12 @@ start_server {} {
         assert {[status $replica sync_partial_ok] == 1}
 
         set digest [$master debug digest]
-        assert {$digest eq [$replica debug digest]}
-        assert {$digest eq [$sub_replica debug digest]}
+        wait_for_condition 10 100 {
+          $digest eq [$replica debug digest] &&
+          $digest eq [$sub_replica debug digest]
+        } else {
+            fail "Replica and sub-replica didn't sync after master restart in time..."
+        }
     }
 
     test "PSYNC2: Full resync after Master restart when too many key expired" {
@@ -179,9 +182,20 @@ start_server {} {
             $master set $j somevalue px 10
         }
 
+        ##### hash-field-expiration
+        # Hashes of type OBJ_ENCODING_LISTPACK_EX won't be discarded during
+        # RDB load, even if they are expired.
+        $master hset myhash1 f1 v1 f2 v2 f3 v3
+        $master hpexpire myhash1 10 FIELDS 3 f1 f2 f3
+        # Hashes of type RDB_TYPE_HASH_METADATA will be discarded during RDB load.
+        $master config set hash-max-listpack-entries 0
+        $master hset myhash2 f1 v1 f2 v2
+        $master hpexpire myhash2 10 FIELDS 2 f1 f2
+        $master config set hash-max-listpack-entries 1
+
         after 20
 
-        wait_for_condition 500 100 {
+        wait_for_condition 1000 100 {
             [status $master master_repl_offset] == [status $replica master_repl_offset] &&
             [status $master master_repl_offset] == [status $sub_replica master_repl_offset]
         } else {

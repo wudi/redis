@@ -252,7 +252,7 @@ start_server {tags {"keyspace"}} {
         assert {[r get mynewkey{t}] eq "foobar"}
     }
 
-source "tests/unit/type/list-common.tcl"
+array set largevalue [generate_largevalue_test_array]
 foreach {type large} [array get largevalue] {
     set origin_config [config_get_set list-max-listpack-size -1]
     test "COPY basic usage for list - $type" {
@@ -272,7 +272,7 @@ foreach {type large} [array get largevalue] {
 }
 
     foreach type {intset listpack hashtable} {
-        test {COPY basic usage for $type set} {
+        test "COPY basic usage for $type set" {
             r del set1{t} newset1{t}
             r sadd set1{t} 1 2 3
             if {$type ne "intset"} {
@@ -307,14 +307,14 @@ foreach {type large} [array get largevalue] {
         assert_equal $digest [debug_digest_value newzset1{t}]
     }
 
-     test {COPY basic usage for skiplist sorted set} {
+     test {COPY basic usage for btree sorted set} {
         r del zset2{t} newzset2{t}
         set original_max [lindex [r config get zset-max-ziplist-entries] 1]
         r config set zset-max-ziplist-entries 0
         for {set j 0} {$j < 130} {incr j} {
             r zadd zset2{t} [randomInt 50] ele-[randomInt 10]
         }
-        assert_encoding skiplist zset2{t}
+        assert_encoding btree zset2{t}
         r copy zset2{t} newzset2{t}
         set digest [debug_digest_value zset2{t}]
         assert_equal $digest [debug_digest_value newzset2{t}]
@@ -325,7 +325,37 @@ foreach {type large} [array get largevalue] {
         r config set zset-max-ziplist-entries $original_max
     }
 
+    test {COPY duplicates all btree pages while its member table grows} {
+        r del zset-copy-source{t} zset-copy-dest{t}
+        set original_max [lindex [r config get zset-max-listpack-entries] 1]
+        r config set zset-max-listpack-entries 0
+
+        # The last insertion starts a member-table resize and leaves many
+        # score pages still to copy into the new table.
+        for {set j 0} {$j < 3969} {incr j} {
+            r zadd zset-copy-source{t} [expr {$j * 17 % 5003}] \
+                [format "member:%05d:abcdefghijklmnop" $j]
+        }
+        assert_encoding btree zset-copy-source{t}
+        r copy zset-copy-source{t} zset-copy-dest{t}
+        set digest [debug_digest_value zset-copy-source{t}]
+        assert_equal $digest [debug_digest_value zset-copy-dest{t}]
+
+        # Free the source before exercising every copied lookup and rank.
+        r del zset-copy-source{t}
+        assert_equal $digest [debug_digest_value zset-copy-dest{t}]
+        for {set j 0} {$j < 3969} {incr j 31} {
+            set member [format "member:%05d:abcdefghijklmnop" $j]
+            assert {[r zscore zset-copy-dest{t} $member] ne {}}
+            assert {[r zrank zset-copy-dest{t} $member] ne {}}
+            r zincrby zset-copy-dest{t} 0.5 $member
+        }
+        assert_equal 3969 [r zcard zset-copy-dest{t}]
+        r config set zset-max-listpack-entries $original_max
+    }
+
     test {COPY basic usage for listpack hash} {
+        r config set hash-max-listpack-entries 512
         r del hash1{t} newhash1{t}
         r hset hash1{t} tmp 17179869184
         assert_encoding listpack hash1{t}
@@ -506,6 +536,12 @@ foreach {type large} [array get largevalue] {
         r flushdb
         r SET aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1
         r KEYS "a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"
+    } {}
+
+    test {Regression for pattern matching very long nested loops} {
+        r flushdb
+        r SET [string repeat "a" 50000] 1
+        r KEYS [string repeat "*?" 50000]
     } {}
 
     test {Coverage: basic SWAPDB test and unhappy path} {

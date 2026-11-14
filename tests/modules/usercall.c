@@ -13,7 +13,7 @@ int call_without_user(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
 
     const char *cmd = RedisModule_StringPtrLen(argv[1], NULL);
 
-    RedisModuleCallReply *rep = RedisModule_Call(ctx, cmd, "Ev", argv + 2, argc - 2);
+    RedisModuleCallReply *rep = RedisModule_Call(ctx, cmd, "Ev", argv + 2, (size_t)argc - 2);
     if (!rep) {
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     } else {
@@ -37,7 +37,7 @@ int call_with_user_flag(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     const char* flg = RedisModule_StringPtrLen(flags, NULL);
     const char* cmd = RedisModule_StringPtrLen(argv[2], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, flg, argv + 3, argc - 3);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, flg, argv + 3, (size_t)argc - 3);
     if (!rep) {
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     } else {
@@ -89,6 +89,46 @@ int get_acl(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     return REDISMODULE_OK;
 }
 
+/* Sets the context user via SetContextUser, retrieves it via GetContextUser,
+ * then returns the ACL string of that user. Tests SetContextUser + GetContextUser. */
+int get_context_acl(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+
+    if (argc != 1) {
+        return RedisModule_WrongArity(ctx);
+    }
+
+    RedisModule_Assert(user != NULL);
+    RedisModule_SetContextUser(ctx, user);
+    const RedisModuleUser *ctx_user = RedisModule_GetContextUser(ctx);
+    RedisModuleString *acl = RedisModule_GetModuleUserACLString((RedisModuleUser *)ctx_user);
+    RedisModule_ReplyWithString(ctx, acl);
+    RedisModule_FreeString(NULL, acl);
+    return REDISMODULE_OK;
+}
+
+/* Returns the username of the module user via RedisModule_GetUserUsername. Tests GetUserUsername API. */
+int get_user_username(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    REDISMODULE_NOT_USED(argv);
+
+    if (argc != 1) {
+        return RedisModule_WrongArity(ctx);
+    }
+
+    if (user == NULL) {
+        RedisModule_ReplyWithSimpleString(ctx, "none");
+        return REDISMODULE_OK;
+    }
+    RedisModuleString *name = RedisModule_GetUserUsername(ctx, user);
+    if (name == NULL) {
+        RedisModule_ReplyWithSimpleString(ctx, "none");
+        return REDISMODULE_OK;
+    }
+    RedisModule_ReplyWithString(ctx, name);
+    RedisModule_FreeString(ctx, name);
+    return REDISMODULE_OK;
+}
+
 int reset_user(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     REDISMODULE_NOT_USED(argv);
 
@@ -115,6 +155,7 @@ typedef struct {
 
 void *bg_call_worker(void *arg) {
     bg_call_data *bg = arg;
+    RedisModuleBlockedClient *bc = bg->bc;
 
     // Get Redis module context
     RedisModuleCtx *ctx = RedisModule_GetThreadSafeContext(bg->bc);
@@ -133,8 +174,14 @@ void *bg_call_worker(void *arg) {
     RedisModule_StringAppendBuffer(NULL, format_redis_str, "E", 1);
     format = RedisModule_StringPtrLen(format_redis_str, NULL);
     const char *cmd = RedisModule_StringPtrLen(bg->argv[2], NULL);
-    RedisModuleCallReply *rep = RedisModule_Call(ctx, cmd, format, bg->argv + 3, bg->argc - 3);
+    RedisModuleCallReply *rep = RedisModule_Call(ctx, cmd, format, bg->argv + 3, (size_t)bg->argc - 3);
     RedisModule_FreeString(NULL, format_redis_str);
+
+    /* Free the arguments within GIL to prevent simultaneous freeing in main thread. */
+    for (int i=0; i<bg->argc; i++)
+        RedisModule_FreeString(ctx, bg->argv[i]);
+    RedisModule_Free(bg->argv);
+    RedisModule_Free(bg);
 
     // Release GIL
     RedisModule_ThreadSafeContextUnlock(ctx);
@@ -148,13 +195,7 @@ void *bg_call_worker(void *arg) {
     }
 
     // Unblock client
-    RedisModule_UnblockClient(bg->bc, NULL);
-
-    /* Free the arguments */
-    for (int i=0; i<bg->argc; i++)
-        RedisModule_FreeString(ctx, bg->argv[i]);
-    RedisModule_Free(bg->argv);
-    RedisModule_Free(bg);
+    RedisModule_UnblockClient(bc, NULL);
 
     // Free the Redis module context
     RedisModule_FreeThreadSafeContext(ctx);
@@ -195,6 +236,7 @@ int call_with_user_bg(RedisModuleCtx *ctx, RedisModuleString **argv, int argc)
     pthread_t tid;
     int res = pthread_create(&tid, NULL, bg_call_worker, bg);
     assert(res == 0);
+    pthread_detach(tid);
 
     return REDISMODULE_OK;
 }
@@ -222,6 +264,12 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
         return REDISMODULE_ERR;
 
     if (RedisModule_CreateCommand(ctx,"usercall.get_acl", get_acl,"write",0,0,0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"usercall.get_context_acl", get_context_acl,"write",0,0,0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"usercall.get_user_username", get_user_username,"readonly",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
     return REDISMODULE_OK;

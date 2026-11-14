@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 foreach is_eval {0 1} {
 
 if {$is_eval == 1} {
@@ -58,6 +72,48 @@ start_server {tags {"scripting"}} {
     test {EVAL - Does Lua interpreter replies to our requests?} {
         run_script {return 'hello'} 0
     } {hello}
+
+    test {Lua tostring hides object addresses} {
+        set result [run_script {
+            local objects = {
+                tostring, pairs, pcall, function() end,
+                coroutine, string, math, table,
+                coroutine.create(function() end), cjson.null
+            }
+            for i = 1, 5 do table.insert(objects, {}) end
+            local result = {}
+            for _, object in ipairs(objects) do
+                table.insert(result, tostring(object))
+            end
+            return result
+        } 0]
+        foreach expected_type {function function function function table table table table thread userdata
+                               table table table table table} value $result {
+            assert_equal "$expected_type: <opaque>" $value
+        }
+    }
+
+    test {Lua tostring preserves scalar conversions} {
+        run_script {
+            return {tostring(nil), tostring(true), tostring(false),
+                    tostring(42), tostring(-1), tostring(1.5),
+                    tostring('hello'), tostring('')}
+        } 0
+    } {nil true false 42 -1 1.5 hello {}}
+
+    test {Lua tostring honors custom metamethods and their errors} {
+        run_script {
+            local object = setmetatable({name = 'custom'}, {
+                __tostring = function(self) return self.name end
+            })
+            local failing = setmetatable({}, {
+                __tostring = function() error('custom tostring error') end
+            })
+            local ok, err = pcall(tostring, failing)
+            assert(not ok and string.find(err, 'custom tostring error', 1, true))
+            return tostring(object)
+        } 0
+    } {custom}
 
     test {EVAL - Return _G} {
         run_script {return _G} 0
@@ -145,6 +201,14 @@ start_server {tags {"scripting"}} {
             return {type(foo),foo}
         } 1 x
     } {number 1}
+
+    test {EVAL - Lua number -> Redis integer conversion} {
+        r del hash
+        run_script {
+            local foo = redis.pcall('hincrby','hash','field',200000000)
+            return {type(foo),foo}
+        } 0
+    } {number 200000000}
 
     test {EVAL - Redis bulk -> Lua type conversion} {
         r set mykey myval
@@ -257,6 +321,11 @@ start_server {tags {"scripting"}} {
         run_script {return redis.pcall('wait','1','0')} 0
     } {0}
 
+    test {EVAL - Scripts do not block on waitaof} {
+        r config set appendonly no
+        run_script {return redis.pcall('waitaof','0','1','0')} 0
+    } {0 0}
+
     test {EVAL - Scripts do not block on XREAD with BLOCK option} {
         r del s
         r xgroup create s g $ MKSTREAM
@@ -328,6 +397,87 @@ start_server {tags {"scripting"}} {
         set e
     } {*against a key*}
 
+    test {EVAL - Test table unpack with invalid indexes} {
+        catch {run_script { return {unpack({1,2,3}, -2, 2147483647)} } 0} e
+        assert_match {*too many results to unpack*} $e
+        catch {run_script { return {unpack({1,2,3}, 0, 2147483647)} } 0} e
+        assert_match {*too many results to unpack*} $e
+        catch {run_script { return {unpack({1,2,3}, -2147483648, -2)} } 0} e
+        assert_match {*too many results to unpack*} $e
+        set res [run_script { return {unpack({1,2,3}, -1, -2)} } 0]
+        assert_match {} $res
+        set res [run_script { return {unpack({1,2,3}, 1, -1)} } 0]
+        assert_match {} $res
+
+        # unpack with range -1 to 5, verify nil indexes
+        set res [run_script {
+             local function unpack_to_list(t, i, j)
+               local n, v = select('#', unpack(t, i, j)), {unpack(t, i, j)}
+               for i = 1, n do v[i] = v[i] or '_NIL_' end
+               v.n = n
+               return v
+             end
+
+            return unpack_to_list({1,2,3}, -1, 5)
+        } 0]
+        assert_match {_NIL_ _NIL_ 1 2 3 _NIL_ _NIL_} $res
+
+        # unpack with negative range, verify nil indexes
+        set res [run_script {
+             local function unpack_to_list(t, i, j)
+               local n, v = select('#', unpack(t, i, j)), {unpack(t, i, j)}
+               for i = 1, n do v[i] = v[i] or '_NIL_' end
+               v.n = n
+               return v
+             end
+
+            return unpack_to_list({1,2,3}, -2147483648, -2147483646)
+        } 0]
+        assert_match {_NIL_ _NIL_ _NIL_} $res
+    } {}
+
+    test {EVAL maximum pattern match depth} {
+        r script flush
+
+        # No problem below maximum depth
+        set res [run_script {
+            return string.find(string.rep("a", 199), string.rep(".?", 199))
+        } 0]
+        assert_equal $res 1
+
+        # No problem below maximum depth even with longer string
+        set res [run_script {
+            return string.find(redis.call("info"), string.rep(".?", 199))
+        } 0]
+        assert_equal $res 1
+
+        set res [run_script {
+            return string.match(redis.call("info"), "connected_slaves:0")
+        } 0]
+        assert_equal $res "connected_slaves:0"
+
+        catch {run_script {
+            return string.find(string.rep("a", 200), string.rep(".?", 200))
+        } 0 } e
+        assert_match {*pattern too complex*} $e
+
+        catch {run_script {
+            return string.match(string.rep("a", 200), string.rep(".?", 200))
+        } 0 } e
+        assert_match {*pattern too complex*} $e
+
+        catch {run_script {
+            for _ in string.gmatch(string.rep("a", 200), string.rep(".?", 200)) do end
+            return 1
+        } 0 } e
+        assert_match {*pattern too complex*} $e
+
+        catch {run_script {
+            return string.gsub(string.rep("a", 200), string.rep(".?", 200), "b")
+        } 0 } e
+        assert_match {*pattern too complex*} $e
+    } {}
+
     test {EVAL - JSON string encoding a string larger than 2GB} {
         run_script {
             local s = string.rep("a", 1024 * 1024 * 1024)
@@ -351,6 +501,65 @@ start_server {tags {"scripting"}} {
                 return {decoded.keya, decoded.keyb}
         } 0
     } {a b}
+
+    test {EVAL - JSON empty array decoding} {
+        # Default behavior
+        assert_equal "{}" [run_script {
+            return cjson.encode(cjson.decode('[]'))
+        } 0]
+        assert_equal "{}" [run_script {
+            cjson.decode_array_with_array_mt(false)
+            return cjson.encode(cjson.decode('[]'))
+        } 0]
+        assert_equal "{\"item\":{}}" [run_script {
+            cjson.decode_array_with_array_mt(false)
+            return cjson.encode(cjson.decode('{"item": []}'))
+        } 0]
+
+        # With array metatable
+        assert_equal "\[\]" [run_script {
+            cjson.decode_array_with_array_mt(true)
+            return cjson.encode(cjson.decode('[]'))
+        } 0]
+        assert_equal "{\"item\":\[\]}" [run_script {
+            cjson.decode_array_with_array_mt(true)
+            return cjson.encode(cjson.decode('{"item": []}'))
+        } 0]
+    }
+
+    test {EVAL - JSON empty array decoding after element removal} {
+        # Default: emptied array becomes object
+        assert_equal "{}" [run_script {
+            cjson.decode_array_with_array_mt(false)
+            local t = cjson.decode('[1, 2]')
+            -- emptying the array
+            t[1] = nil
+            t[2] = nil
+            return cjson.encode(t)
+        } 0]
+
+        # With array metatable: emptied array stays array
+        assert_equal "\[\]" [run_script {
+            cjson.decode_array_with_array_mt(true)
+            local t = cjson.decode('[1, 2]')
+            -- emptying the array
+            t[1] = nil
+            t[2] = nil
+            return cjson.encode(t)
+        } 0]
+    }
+
+    test {EVAL - cjson array metatable modification should be readonly} {
+        catch {
+            run_script {
+                cjson.decode_array_with_array_mt(true)
+                local t = cjson.decode('[]')
+                getmetatable(t).__is_cjson_array = function() return 1 end
+                return cjson.encode(t)
+            } 0
+        } e
+        set _ $e
+    } {*Attempt to modify a readonly table*}
 
     test {EVAL - JSON smoke test} {
         run_script {
@@ -431,6 +640,16 @@ start_server {tags {"scripting"}} {
                 return h
         } 0
     } {d3ffffff0000000000}
+
+    test {EVAL - cmsgpack can unpack negative int32 and int64?} {
+        run_script {local i32 = cmsgpack.unpack(string.char(0xd2, 0x80, 0, 0, 0))
+                local i64 = cmsgpack.unpack(string.char(0xd3, 0x80, 0, 0, 0, 0, 0, 0, 0))
+                if i32 == -2147483648 and i64 == -9223372036854775808 then
+                    return 1
+                end
+                return 0
+        } 0
+    } {1}
 
     test {EVAL - cmsgpack pack/unpack smoke test} {
         run_script {
@@ -564,13 +783,19 @@ start_server {tags {"scripting"}} {
     # script command is only relevant for is_eval Lua
     test {SCRIPTING FLUSH - is able to clear the scripts cache?} {
         r set mykey myval
+
+        r script load {return redis.call('get',KEYS[1])}
         set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
         assert_equal $v myval
-        set e ""
         r script flush
-        catch {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey} e
-        set e
-    } {NOSCRIPT*}
+        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+
+        r eval {return redis.call('get',KEYS[1])} 1 mykey
+        set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
+        assert_equal $v myval
+        r script flush
+        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+    }
 
     test {SCRIPTING FLUSH ASYNC} {
         for {set j 0} {$j < 100} {incr j} {
@@ -616,6 +841,52 @@ start_server {tags {"scripting"}} {
              [run_script {return redis.sha1hex('Pizza & Mandolino')} 0]
     } {da39a3ee5e6b4b0d3255bfef95601890afd80709 74822d82031af7493c20eefa13bd07ec4fada82f}
 
+    test "Measures elapsed time os.clock()" {
+        set escaped [run_script {
+            local start = os.clock()
+            while os.clock() - start < 1 do end
+            return {double = os.clock() - start}
+        } 0]
+        assert_morethan_equal $escaped 1 ;# 1 second
+    }
+
+    test "Prohibit dangerous lua methods in sandbox" {
+        assert_equal "" [run_script {
+            local allowed_methods = {"clock"}
+            -- Find a value from a tuple and return the position.
+            local indexOf = function(tuple, value)
+                for i, v in ipairs(tuple) do
+                    if v == value then return i end
+                end
+                return nil
+            end
+            -- Check for disallowed methods and verify all allowed methods exist.
+            -- If an allowed method is found, it's removed from 'allowed_methods'.
+            -- If 'allowed_methods' is empty at the end, all allowed methods were found.
+            for key, value in pairs(os) do
+                local index = indexOf(allowed_methods, key)
+                if index == nil or type(value) ~= "function" then
+                    return "Disallowed "..type(value)..":"..key
+                end
+                table.remove(allowed_methods, index)
+            end
+            if #allowed_methods ~= 0 then
+                return "Expected method not found: "..table.concat(allowed_methods, ",")
+            end
+            return ""
+        } 0]
+    }
+
+    test "Verify execution of prohibit dangerous Lua methods will fail" {
+        assert_error {ERR *attempt to call field 'execute'*} {run_script {os.execute()} 0}
+        assert_error {ERR *attempt to call field 'exit'*} {run_script {os.exit()} 0}
+        assert_error {ERR *attempt to call field 'getenv'*} {run_script {os.getenv()} 0}
+        assert_error {ERR *attempt to call field 'remove'*} {run_script {os.remove()} 0}
+        assert_error {ERR *attempt to call field 'rename'*} {run_script {os.rename()} 0}
+        assert_error {ERR *attempt to call field 'setlocale'*} {run_script {os.setlocale()} 0}
+        assert_error {ERR *attempt to call field 'tmpname'*} {run_script {os.tmpname()} 0}
+    }
+
     test {Globals protection reading an undeclared global variable} {
         catch {run_script {return a} 0} e
         set e
@@ -625,6 +896,12 @@ start_server {tags {"scripting"}} {
         catch {run_script {a=10} 0} e
         set e
     } {ERR *Attempt to modify a readonly table*}
+
+    test {lua bit.tohex bug} {
+        set res [run_script {return bit.tohex(65535, -2147483648)} 0]
+        r ping
+        set res
+    } {0000FFFF}
 
     test {Test an example script DECR_IF_GT} {
         set decr_if_gt {
@@ -1014,6 +1291,27 @@ start_server {tags {"scripting"}} {
         set _ $e
     } {*Attempt to modify a readonly table*}
 
+    test "Try trick readonly table on basic types metatable" {
+        # Run the following scripts for basic types. Either getmetatable()
+        # should return nil or the metatable must be readonly.
+        set scripts {
+            {getmetatable(nil).__index = function() return 1 end}
+            {getmetatable('').__index = function() return 1 end}
+            {getmetatable(123.222).__index = function() return 1 end}
+            {getmetatable(true).__index = function() return 1 end}
+            {getmetatable(function() return 1 end).__index = function() return 1 end}
+            {getmetatable(coroutine.create(function() return 1 end)).__index = function() return 1 end}
+        }
+
+        foreach code $scripts {
+            catch {run_script $code 0} e
+            assert {
+                [string match "*attempt to index a nil value script*" $e] ||
+                [string match "*Attempt to modify a readonly table*" $e]
+            }
+        }
+    }
+
     test "Test loadfile are not available" {
         catch {
             run_script {
@@ -1042,6 +1340,118 @@ start_server {tags {"scripting"}} {
     } {*Script attempted to access nonexistent global variable 'print'*}
 }
 
+# start a new server to test the large-memory tests
+start_server {tags {"scripting external:skip large-memory"}} {
+    test {EVAL - JSON string encoding a string larger than 2GB} {
+        run_script {
+            local s = string.rep("a", 1024 * 1024 * 1024)
+            return #cjson.encode(s..s..s)
+        } 0
+    } {3221225474} ;# length includes two double quotes at both ends
+
+    test {EVAL - Test long escape sequences for strings} {
+        run_script {
+            -- Generate 1gb '==...==' separator
+            local s = string.rep('=', 1024 * 1024)
+            local t = {} for i=1,1024 do t[i] = s end
+            local sep = table.concat(t)
+            collectgarbage('collect')
+
+            local code = table.concat({'return [',sep,'[x]',sep,']'})
+            collectgarbage('collect')
+
+            -- Load the code and run it. Script will return the string length.
+            -- Escape sequence: [=....=[ to ]=...=] will be ignored
+            -- Actual string is a single character: 'x'. Script will return 1
+            local func = loadstring(code)
+            return #func()
+        } 0
+    } {1}
+
+    test {EVAL - Lua can parse string with too many new lines} {
+        # Create a long string consisting only of newline characters. When Lua
+        # fails to parse a string, it typically includes a snippet like
+        # "... near ..." in the error message to indicate the last recognizable
+        # token. In this test, since the input contains only newlines, there
+        # should be no identifiable token, so the error message should contain
+        # only the actual error, without a near clause.
+
+        run_script {
+           local s = string.rep('\n', 1024 * 1024)
+           local t = {} for i=1,2048 do t[#t+1] = s end
+           local lines = table.concat(t)
+           local fn, err = loadstring(lines)
+           return err
+        } 0
+    } {*chunk has too many lines}
+}
+
+# Start a new server to test lua-enable-deprecated-api config
+foreach enabled {no yes} {
+start_server [subst {tags {"scripting external:skip"} overrides {lua-enable-deprecated-api $enabled}}] {
+    test "Test setfenv availability lua-enable-deprecated-api=$enabled" {
+        catch {
+            run_script {
+                local f = function() return 1 end
+                setfenv(f, {})
+                return 0
+            } 0
+        } e
+        if {$enabled} {
+            assert_equal $e 0
+        } else {
+            assert_match {*Script attempted to access nonexistent global variable 'setfenv'*} $e
+        }
+    }
+
+    test "Test getfenv availability lua-enable-deprecated-api=$enabled" {
+        catch {
+            run_script {
+                local f = function() return 1 end
+                getfenv(f)
+                return 0
+            } 0
+        } e
+        if {$enabled} {
+            assert_equal $e 0
+        } else {
+            assert_match {*Script attempted to access nonexistent global variable 'getfenv'*} $e
+        }
+    }
+
+    test "Test newproxy availability lua-enable-deprecated-api=$enabled" {
+        catch {
+            run_script {
+                getmetatable(newproxy(true)).__gc = function() return 1 end
+                return 0
+            } 0
+        } e
+        if {$enabled} {
+            assert_equal $e 0
+        } else {
+            assert_match {*Script attempted to access nonexistent global variable 'newproxy'*} $e
+        }
+    }
+
+    if {$enabled} {
+        test {Lua tostring hides full userdata addresses} {
+            run_script {return {tostring(newproxy(false)), tostring(newproxy(true))}} 0
+        } {{userdata: <opaque>} {userdata: <opaque>}}
+
+        test {Lua tostring honors full userdata metamethods} {
+            run_script {
+                local object = newproxy(true)
+                getmetatable(object).__tostring = function(self)
+                    assert(self == object)
+                    return 'custom userdata'
+                end
+                return tostring(object)
+            } 0
+        } {custom userdata}
+    }
+}
+}
+
 # Start a new server since the last test in this stanza will kill the
 # instance at all.
 start_server {tags {"scripting"}} {
@@ -1056,6 +1466,40 @@ start_server {tags {"scripting"}} {
         after 200 ; # Give some time to Lua to call the hook again...
         assert_equal [r ping] "PONG"
         $rd close
+    }
+
+    test {Timedout scripts stuck in Lua pattern matching can be killed by SCRIPT KILL} {
+        set rd [redis_deferring_client]
+        r config set lua-time-limit 10
+        # Catastrophic backtracking: this pattern never matches and would run
+        # (effectively) forever. The whole match runs inside the C function
+        # match() in deps/lua/src/lstrlib.c, so before the fix neither
+        # lua-time-limit nor SCRIPT KILL could interrupt it and the entire
+        # server hung until it was killed with SIGKILL.
+        run_script_on_connection $rd {return string.find(string.rep('A', 100), string.rep('(.+)', 10) .. '!')} 0
+
+        # The server must stay responsive (report BUSY) rather than hang.
+        wait_for_condition 50 100 {
+            [catch {r ping} e] == 1
+        } else {
+            fail "Can't wait for script to start running"
+        }
+        catch {r ping} e
+        assert_match {BUSY*} $e
+
+        kill_script
+
+        wait_for_condition 50 100 {
+            [catch {r ping} e] == 0
+        } else {
+            fail "Can't wait for script to be killed"
+        }
+        assert_equal [r ping] "PONG"
+
+        catch {$rd read} res
+        $rd close
+
+        assert_match {*killed by user*} $res
     }
 
     test {Timedout read-only scripts can be killed by SCRIPT KILL even when use pcall} {
@@ -1090,7 +1534,7 @@ start_server {tags {"scripting"}} {
         set rd [redis_deferring_client]
         r config set lua-time-limit 10
 
-        # senging (in a pipeline):
+        # sending (in a pipeline):
         # 1. eval "while 1 do redis.call('ping') end" 0
         # 2. ping
         if {$is_eval == 1} {
@@ -1146,6 +1590,11 @@ start_server {tags {"scripting"}} {
         # enable AOF to also expose an assertion if the bug would happen
         r flushall
         r config set appendonly yes
+        # Wait for the initial AOF rewrite to complete (it may be slow, e.g. due
+        # to a slow fsync), otherwise aof_state may still be AOF_WAIT_REWRITE
+        # when the "SHUTDOWN NOSAVE" test below runs, and the shutdown will be
+        # refused with "Writing initial AOF, can't exit".
+        waitForBgrewriteaof r
 
         # create clients, and set one to block waiting for key 'x'
         set rd [redis_deferring_client]
@@ -1375,6 +1824,157 @@ start_server {tags {"scripting repl external:skip"}} {
             assert {[r mget a b c d] eq {1 {} 3 4}}
         }
 
+        test "HEXPIRE HGETDEL HGETEX honor redis.set_repl REPL_NONE" {
+            r del h h2 h3
+            r hset h f v
+            r hset h2 a 1
+            r hset h3 c 1
+            run_script {
+                redis.set_repl(redis.REPL_NONE);
+                redis.call('hexpire','h',100,'FIELDS','1','f');
+                redis.call('hgetdel','h2','FIELDS','1','a');
+                redis.call('hgetex','h3','EX','100','FIELDS','1','c');
+            } 3 h h2 h3
+            r debug loadaof
+            assert_equal [r httl h FIELDS 1 f] -1
+            assert_equal [r hexists h2 a] 1
+            assert_equal [r httl h3 FIELDS 1 c] -1
+        }
+
+        test "Test selective replication of effect commands from Lua" {
+            # Commands that replace their own propagation (the counted form of
+            # SPOP propagates as SREM) queue the replacement via
+            # alsoPropagate(), which must honor set_repl() as well.
+            set keys {s1{t} s2{t} s3{t} s4{t}}
+            r del {*}$keys
+            foreach key $keys {
+                r sadd $key a b c d e
+            }
+            run_script {
+                redis.call('spop',KEYS[1],2);
+                redis.set_repl(redis.REPL_NONE);
+                redis.call('spop',KEYS[2],2);
+                redis.set_repl(redis.REPL_AOF);
+                redis.call('spop',KEYS[3],2);
+                redis.set_repl(redis.REPL_ALL);
+                redis.call('spop',KEYS[4],2);
+            } 4 {*}$keys
+
+            # The master popped members from all the four sets.
+            assert_equal {3 3 3 3} [lmap key $keys {r scard $key}]
+
+            # Only the SREM of s1 and s4 should have reached the replica.
+            wait_for_condition 50 100 {
+                [lmap key $keys {r -1 scard $key}] eq {3 5 5 3}
+            } else {
+                fail "Only the SREM of s1 and s4 should be replicated to replica"
+            }
+
+            # After an AOF reload only s1, s3 and s4 should be trimmed.
+            r debug loadaof
+
+            assert_equal {3 5 3 3} [lmap key $keys {r scard $key}]
+        }
+
+        test "Test selective replication of HIMPORT SET from Lua" {
+            # HIMPORT SET replaces its own propagation with a RESTORE queued via
+            # alsoPropagate(), so it must honor set_repl() too. The fieldset
+            # prepared by HIMPORT PREPARE is per-client state, hence both calls
+            # have to happen inside the same script.
+            r del ht1{t} ht2{t}
+            run_script {
+                redis.call('himport','prepare','fs','f1','f2');
+                redis.set_repl(redis.REPL_NONE);
+                redis.call('himport','set',KEYS[1],'fs','v1','v2');
+                redis.set_repl(redis.REPL_ALL);
+                redis.call('himport','set',KEYS[2],'fs','v3','v4');
+            } 2 ht1{t} ht2{t}
+
+            assert_equal {v1 v2} [r hmget ht1{t} f1 f2]
+            assert_equal {v3 v4} [r hmget ht2{t} f1 f2]
+
+            wait_for_condition 50 100 {
+                [r -1 hmget ht2{t} f1 f2] eq {v3 v4}
+            } else {
+                fail "The RESTORE of ht2 should be replicated to replica"
+            }
+            assert_equal 0 [r -1 exists ht1{t}]
+        }
+
+        test "Test implicit deletions are replicated despite set_repl(REPL_NONE)" {
+            # Keys and hash fields deleted because they expired are an implicit
+            # decision of the server, so they must always be propagated, no
+            # matter what the script that happened to touch them asked for.
+            r debug set-active-expire 0
+            r del expkey{t} exphash{t} sentinel{t}
+            r set expkey{t} v px 1
+            r hset exphash{t} f1 v1 f2 v2
+            r hpexpire exphash{t} 1 fields 1 f1
+            after 20
+
+            set repl [attach_to_replication_stream]
+            run_script {
+                redis.set_repl(redis.REPL_NONE);
+                redis.call('get',KEYS[1]);
+                redis.call('hget',KEYS[2],'f1');
+                redis.set_repl(redis.REPL_ALL);
+                redis.call('set',KEYS[3],'1');
+            } 3 expkey{t} exphash{t} sentinel{t}
+
+            if {$is_eval} {
+                assert_replication_stream $repl {
+                    {multi}
+                    {select *}
+                    {del expkey{t}}
+                    {hdel exphash{t} f1}
+                    {set sentinel{t} 1}
+                    {exec}
+                }
+            } else {
+                assert_replication_stream $repl {
+                    {select *}
+                    {function load *}
+                    {multi}
+                    {del expkey{t}}
+                    {hdel exphash{t} f1}
+                    {set sentinel{t} 1}
+                    {exec}
+                }
+            }
+            close_replication_stream $repl
+            r debug set-active-expire 1
+        }
+
+        test "Test no empty MULTI/EXEC is replicated for AOF-only effects" {
+            # Both SREM the SPOP calls queue are restricted to the AOF, so the
+            # replica must receive nothing at all: not even the MULTI / EXEC
+            # that wraps them in the AOF.
+            r del myset{t} sentinel{t}
+            r sadd myset{t} a b c d e
+
+            set repl [attach_to_replication_stream]
+            run_script {
+                redis.set_repl(redis.REPL_AOF);
+                redis.call('spop',KEYS[1],2);
+                redis.call('spop',KEYS[1],2);
+            } 1 myset{t}
+            r set sentinel{t} 1
+
+            if {$is_eval} {
+                assert_replication_stream $repl {
+                    {select *}
+                    {set sentinel{t} 1}
+                }
+            } else {
+                assert_replication_stream $repl {
+                    {select *}
+                    {function load *}
+                    {set sentinel{t} 1}
+                }
+            }
+            close_replication_stream $repl
+        }
+
         test "PRNG is seeded randomly for command replication" {
             if {$is_eval eq 1} {
                 # on is_eval Lua we need to call redis.replicate_commands() to get real randomization
@@ -1456,6 +2056,93 @@ start_server {tags {"scripting needs:debug external:skip"}} {
         assert_equal [r ping] {PONG}
     }
 }
+
+start_server {tags {"scripting external:skip"}} {
+    test {Lua scripts eviction does not generate many scripts} {
+        r script flush
+        r config resetstat
+
+        # "return 1" sha is: e0e1f9fabfc9d4800c877a703b823ac0578ff8db
+        # "return 500" sha is: 98fe65896b61b785c5ed328a5a0a1421f4f1490c
+        for {set j 1} {$j <= 250} {incr j} {
+            r eval "return $j" 0
+        }
+        for {set j 251} {$j <= 500} {incr j} {
+            r eval_ro "return $j" 0
+        }
+        assert_equal [s number_of_cached_scripts] 500
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        assert_equal 1 [r evalsha_ro e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        assert_equal 500 [r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+        assert_equal 500 [r evalsha_ro 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+
+        # Scripts between "return 1" and "return 500" are evicted
+        for {set j 501} {$j <= 750} {incr j} {
+            r eval "return $j" 0
+        }
+        for {set j 751} {$j <= 1000} {incr j} {
+            r eval "return $j" 0
+        }
+        assert_error {NOSCRIPT*} {r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0}
+        assert_error {NOSCRIPT*} {r evalsha_ro e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0}
+        assert_error {NOSCRIPT*} {r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0}
+        assert_error {NOSCRIPT*} {r evalsha_ro 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0}
+
+        assert_equal [s evicted_scripts] 500
+        assert_equal [s number_of_cached_scripts] 500
+    }
+
+    test {Lua scripts eviction is plain LRU} {
+        r script flush
+        r config resetstat
+
+        # "return 1" sha is: e0e1f9fabfc9d4800c877a703b823ac0578ff8db
+        # "return 2" sha is: 7f923f79fe76194c868d7e1d0820de36700eb649
+        # "return 3" sha is: 09d3822de862f46d784e6a36848b4f0736dda47a
+        # "return 500" sha is: 98fe65896b61b785c5ed328a5a0a1421f4f1490c
+        # "return 1000" sha is: 94f1a7bc9f985a1a1d5a826a85579137d9d840c8
+        for {set j 1} {$j <= 500} {incr j} {
+            r eval "return $j" 0
+        }
+
+        # Call "return 1" to move it to the tail.
+        r eval "return 1" 0
+        # Call "return 2" to move it to the tail.
+        r evalsha 7f923f79fe76194c868d7e1d0820de36700eb649 0
+        # Create a new script, "return 3" will be evicted.
+        r eval "return 1000" 0
+        # "return 1" is ok since it was moved to tail.
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        # "return 2" is ok since it was moved to tail.
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        # "return 3" was evicted.
+        assert_error {NOSCRIPT*} {r evalsha 09d3822de862f46d784e6a36848b4f0736dda47a 0}
+        # Others are ok.
+        assert_equal 500 [r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+        assert_equal 1000 [r evalsha 94f1a7bc9f985a1a1d5a826a85579137d9d840c8 0]
+
+        assert_equal [s evicted_scripts] 1
+        assert_equal [s number_of_cached_scripts] 500
+    }
+
+    test {Lua scripts eviction does not affect script load} {
+        r script flush
+        r config resetstat
+
+        set num [randomRange 500 1000]
+        for {set j 1} {$j <= $num} {incr j} {
+            r script load "return $j"
+            r eval "return 'str_$j'" 0
+        }
+        set evicted [s evicted_scripts]
+        set cached [s number_of_cached_scripts]
+        # evicted = num eval scripts - 500 eval scripts
+        assert_equal $evicted [expr $num-500]
+        # cached = num load scripts + 500 eval scripts
+        assert_equal $cached [expr $num+500]
+    }
+}
+
 } ;# is_eval
 
 start_server {tags {"scripting needs:debug"}} {
@@ -1724,6 +2411,56 @@ start_server {tags {"scripting needs:debug"}} {
 
     r debug set-disable-deny-scripts 0
 }
+
+start_server {tags {"scripting"}} {
+    test "Test script flush will not leak memory - script:$is_eval" {
+        r flushall
+        r script flush
+        r function flush
+
+        # This is a best-effort test to check we don't leak some resources on
+        # script flush and function flush commands. For lua vm, we create a
+        # jemalloc thread cache. On each script flush command, thread cache is
+        # destroyed and we create a new one. In this test, running script flush
+        # many times to verify there is no increase in the memory usage while
+        # re-creating some of the resources for lua vm.
+        set used_memory [s used_memory]
+        set allocator_allocated [s allocator_allocated]
+
+        r multi
+        for {set j 1} {$j <= 500} {incr j} {
+            if {$is_eval} {
+                r SCRIPT FLUSH
+            } else {
+                r FUNCTION FLUSH
+            }
+        }
+        r exec
+
+        # Verify used memory is not (much) higher.
+        assert_lessthan [s used_memory] [expr $used_memory*1.5]
+        assert_lessthan [s allocator_allocated] [expr $allocator_allocated*1.5]
+    }
+
+    test "Verify Lua performs GC correctly after script loading" {
+        set dummy_script "--[string repeat x 10]\nreturn "
+        set n 50000
+        for {set i 0} {$i < $n} {incr i} {
+            set script "$dummy_script[format "%06d" $i]"
+            if {$is_eval} {
+                r script load $script
+            } else {
+                r function load "#!lua name=test$i\nredis.register_function('test$i', function(KEYS, ARGV)\n $script \nend)"
+            }
+        }
+
+        if {$is_eval} {
+            assert_lessthan [s used_memory_lua] 17500000
+        } else {
+            assert_lessthan [s used_memory_vm_functions] 14500000
+        }
+    } {} {debug_defrag:skip}
+}
 } ;# foreach is_eval
 
 
@@ -1758,6 +2495,41 @@ start_server {tags {"scripting"}} {
             } 0
         } e
         assert_match {*Unexpected flag in script shebang*} $e
+    }
+
+    foreach command {eval eval_ro {script load}} {
+        foreach {field shebang} {
+            engine {#!"lua%s" flags=no-writes}
+            option {#!lua flags=no-writes "bad=%s"}
+            flags {#!lua flags="no-writes,bad%s,allow-oom"}
+        } {
+            test "Reject CR and LF in shebang $field - $command" {
+                # Quoted shebang arguments decode escapes, including hex escapes.
+                # Check the entire token, even after an embedded NUL byte.
+                foreach symbols [list {\r} {\n} {\r\n+INJECTED\r\n} \
+                                      {\x0d} {\x0a} {\x0d\x0a+INJECTED\x0d\x0a} \
+                                      {\x00\r} {\x00\n} "\r"] {
+                    set script "[format $shebang $symbols]\nreturn 1"
+                    set args [list $script]
+                    if {$command ne "script load"} {lappend args 0}
+                    assert_error {ERR Invalid symbols in script shebang} {
+                        r {*}$command {*}$args
+                    }
+                    # An injected reply must not be left on the connection.
+                    assert_equal PONG [r ping]
+                }
+            }
+        }
+
+        test "Quoted shebang tokens with CRLF line endings - $command" {
+            set script "#!\"lua\" flags=\"no-writes,allow-oom\"\r\nreturn 1 -- $command"
+            if {$command eq "script load"} {
+                set sha [r script load $script]
+                assert_equal 1 [r evalsha_ro $sha 0]
+            } else {
+                assert_equal 1 [r $command $script 0]
+            }
+        }
     }
 
     test "allow-oom shebang flag" {
@@ -1896,6 +2668,14 @@ start_server {tags {"scripting"}} {
             } 1 x
 
             r replicaof [srv -1 host] [srv -1 port]
+
+            # To avoid -LOADING reply, wait until replica syncs with master.
+            wait_for_condition 50 100 {
+                [s master_link_status] eq {up}
+            } else {
+                fail "Replica did not sync in time."
+            }
+
             assert_error {EXECABORT Transaction discarded because of: READONLY *} {$rr exec}
             assert_error {READONLY You can't write against a read only replica. script: *} {$rr2 exec}
             $rr close
@@ -2169,6 +2949,14 @@ start_server {tags {"scripting"}} {
         assert_equal [errorrstat ERR r] {count=1}
     }
 
+    test "LUA redis.error_reply API with CRLF injection attempt" {
+        catch {
+            r eval {error(redis.error_reply("X\r\n+INJECTED"))} 0
+        } err
+        # The error message should have CRLF replaced with spaces
+        assert_match {ERR X  +INJECTED*} $err
+    }
+
     test "LUA redis.status_reply API" {
         r config resetstat
         r readraw 1
@@ -2230,5 +3018,34 @@ start_server {tags {"scripting"}} {
             # Assert the string has been trimmed and the 80 bytes from the previous alloc were not kept.
             assert { [r memory usage foo] <= $expected_memory};
         }
+    }
+
+    test {EVAL - explicit error() call handling} {
+        # error("simple string error")
+        assert_error {ERR user_script:1: simple string error script: *} {
+            r eval "error('simple string error')" 0
+        }
+
+        # error({"err": "ERR table error"})
+        assert_error {ERR table error script: *} {
+            r eval "error({err='ERR table error'})" 0
+        }
+
+        # error({})
+        assert_error {ERR unknown error script: *} {
+            r eval "error({})" 0
+        }
+    }
+}
+
+start_server {tags {"scripting"}} {
+    test "Wrong arity EVAL in acl_check_cmd returns error not crash" {
+        r acl setuser bob on {>123} {+@scripting} {+set} {~x*}
+        assert_equal [r auth bob 123] {OK}
+        # Must be the first Lua call in this server instance
+        catch {run_script {
+            return redis.acl_check_cmd('eval','script')
+        } 0} e
+        assert_match {*Wrong number of args*} $e
     }
 }

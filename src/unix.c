@@ -60,11 +60,24 @@ static int connUnixListen(connListener *listener) {
     for (int j = 0; j < listener->bindaddr_count; j++) {
         char *addr = listener->bindaddr[j];
 
-        unlink(addr); /* don't care if this fails */
+        /* Make sure the path does not belong to an active listener. */
+        fd = anetUnixNonBlockConnect(server.neterr, addr);
+        if (fd != ANET_ERR || errno == EAGAIN) {
+            if (fd != ANET_ERR) close(fd);
+            serverLog(LL_WARNING, "Unix socket %s is already in use", addr);
+            return C_ERR;
+        }
+
+        /* Remove the old path before binding the new Unix socket. */
+        if (unlink(addr) == -1 && errno != ENOENT) {
+            serverLog(LL_WARNING, "Failed removing the old Unix socket %s: %s", addr, strerror(errno));
+            return C_ERR;
+        }
+
         fd = anetUnixServer(server.neterr, addr, *perm, server.tcp_backlog);
         if (fd == ANET_ERR) {
             serverLog(LL_WARNING, "Failed opening Unix socket: %s", server.neterr);
-            exit(1);
+            return C_ERR;
         }
         anetNonBlock(NULL, fd);
         anetCloexec(fd);
@@ -74,18 +87,19 @@ static int connUnixListen(connListener *listener) {
     return C_OK;
 }
 
-static connection *connCreateUnix(void) {
+static connection *connCreateUnix(struct aeEventLoop *el) {
     connection *conn = zcalloc(sizeof(connection));
     conn->type = &CT_Unix;
     conn->fd = -1;
     conn->iovcnt = IOV_MAX;
+    conn->el = el;
 
     return conn;
 }
 
-static connection *connCreateAcceptedUnix(int fd, void *priv) {
+static connection *connCreateAcceptedUnix(struct aeEventLoop *el, int fd, void *priv) {
     UNUSED(priv);
-    connection *conn = connCreateUnix();
+    connection *conn = connCreateUnix(el);
     conn->fd = fd;
     conn->state = CONN_STATE_ACCEPTING;
     return conn;
@@ -101,13 +115,15 @@ static void connUnixAcceptHandler(aeEventLoop *el, int fd, void *privdata, int m
     while(max--) {
         cfd = anetUnixAccept(server.neterr, fd);
         if (cfd == ANET_ERR) {
+            if (anetAcceptFailureNeedsRetry(errno))
+                continue;
             if (errno != EWOULDBLOCK)
                 serverLog(LL_WARNING,
                     "Accepting client connection: %s", server.neterr);
             return;
         }
         serverLog(LL_VERBOSE,"Accepted connection to %s", server.unixsocket);
-        acceptCommonHandler(connCreateAcceptedUnix(cfd, NULL),CLIENT_UNIX_SOCKET,NULL);
+        acceptCommonHandler(connCreateAcceptedUnix(el, cfd, NULL),CLIENT_UNIX_SOCKET,NULL);
     }
 }
 
@@ -121,6 +137,10 @@ static void connUnixClose(connection *conn) {
 
 static int connUnixAccept(connection *conn, ConnectionCallbackFunc accept_handler) {
     return connectionTypeTcp()->accept(conn, accept_handler);
+}
+
+static int connUnixRebindEventLoop(connection *conn, aeEventLoop *el) {
+    return connectionTypeTcp()->rebind_event_loop(conn, el);
 }
 
 static int connUnixWrite(connection *conn, const void *data, size_t data_len) {
@@ -185,6 +205,10 @@ static ConnectionType CT_Unix = {
     .connect = NULL,
     .blocking_connect = NULL,
     .accept = connUnixAccept,
+
+    /* event loop */
+    .unbind_event_loop = NULL,
+    .rebind_event_loop = connUnixRebindEventLoop,
 
     /* IO */
     .write = connUnixWrite,

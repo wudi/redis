@@ -3,13 +3,16 @@
 # basic capabilities for spawning and handling N parallel Redis / Sentinel
 # instances.
 #
-# Copyright (C) 2014 Salvatore Sanfilippo antirez@gmail.com
-# This software is released under the BSD License. See the COPYING file for
-# more information.
+# Copyright (C) 2014-Present, Redis Ltd.
+# All Rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
 
-package require Tcl 8.5
+package require Tcl 8.5-10
 
-set tcl_precision 17
+if {$tcl_version < 9.0} { set tcl_precision 17 }
 source ../support/redis.tcl
 source ../support/util.tcl
 source ../support/aofmanifest.tcl
@@ -37,6 +40,8 @@ set ::dirs {} ; # We remove all the temp dirs at exit
 set ::run_matching {} ; # If non empty, only tests matching pattern are run.
 set ::stop_on_failure 0
 set ::loop 0
+set ::tsan 0
+set ::compression 0
 
 if {[catch {cd tmp}]} {
     puts "tmp directory not found."
@@ -218,9 +223,10 @@ proc is_alive pid {
 }
 
 proc stop_instance pid {
-    catch {exec kill $pid}
     # Node might have been stopped in the test
+    # Send SIGCONT before SIGTERM, otherwise shutdown may be slow with ASAN.
     catch {exec kill -SIGCONT $pid}
+    catch {exec kill $pid}
     if {$::valgrind} {
         set max_wait 120000
     } else {
@@ -306,6 +312,10 @@ proc parse_options {} {
             set ::log_req_res 1
         } elseif {$opt eq {--force-resp3}} {
             set ::force_resp3 1
+        } elseif {$opt eq {--tsan}} {
+            set ::tsan 1
+        } elseif {$opt eq {--compression}} {
+            set ::compression 1
         } elseif {$opt eq "--help"} {
             puts "--single <pattern>      Only runs tests specified by pattern."
             puts "--dont-clean            Keep log files on exit."

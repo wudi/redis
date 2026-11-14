@@ -1,6 +1,6 @@
 set testmodule [file normalize tests/modules/misc.so]
 
-start_server {overrides {save {900 1}} tags {"modules"}} {
+start_server {overrides {save {900 1}} tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {test RM_Call} {
@@ -19,6 +19,29 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         set info [r test.call_generic test.call_generic info commandstats]
         assert { [string match "*cmdstat_module*" $info] }
     }
+
+    test {RM_Call: outer command keeps the off-CPU time of a slow inner command} {
+        r config set slowlog-log-slower-than 10000
+        r slowlog reset
+        r test.call_generic debug sleep 0.05
+        # Newest first: the outer command, logged after the inner DEBUG SLEEP.
+        set e [lindex [r slowlog get 1] 0]
+        assert_match {test.call_generic *} [lindex $e 3]
+        assert {[lindex $e 7] < [lindex $e 2] / 2}
+    } {} {needs:debug}
+
+    test {RM_Call: a middle-level command keeps the off-CPU time of its child} {
+        r config set slowlog-log-slower-than 10000
+        r slowlog reset
+        r test.call_generic test.call_generic debug sleep 0.05
+        # Newest first: outer, middle, then the DEBUG SLEEP.
+        set log [r slowlog get 3]
+        foreach i {0 1} {
+            set e [lindex $log $i]
+            assert_match {test.call_generic *} [lindex $e 3]
+            assert {[lindex $e 7] < [lindex $e 2] / 2}
+        }
+    } {} {needs:debug}
 
     test {test redis version} {
         set version [s redis_version]
@@ -147,6 +170,36 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         assert_equal "PONG" [$rd_trk ping]
         $rd_trk close
     }
+
+    test {RM_SignalModifiedKey - tracking invalidation} {
+        set rd_trk [redis_client]
+        $rd_trk HELLO 3
+        $rd_trk CLIENT TRACKING on
+        r SET mykey{t} abc
+
+        # Track the key by reading it
+        $rd_trk GET mykey{t}
+
+        # # Modify the key using module command that calls RM_SignalModifiedKey
+        r test.signalmodifiedkey mykey{t}
+
+        # # Should receive invalidation message
+        assert_equal {invalidate mykey{t}} [$rd_trk read]
+        assert_equal "PONG" [$rd_trk ping]
+        $rd_trk close
+    }
+
+    test {RM_SignalModifiedKey - update LRM timestamp} {
+        set old_policy [config_get_set maxmemory-policy allkeys-lrm]
+        r SET mykey{t} abc
+        after 2000
+        assert_morethan_equal [r object idletime mykey{t}] 1
+
+        # LRM should be updated.
+        r test.signalmodifiedkey mykey{t}
+        assert_lessthan [r object idletime mykey{t}] 2
+        r config set maxmemory-policy $old_policy
+    } {OK} {slow}
 
     test {publish to self inside rm_call} {
         r hello 3
@@ -466,7 +519,7 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         # rm_call in script mode
         assert_error {MISCONF *} {r test.rm_call_flags S set x 1}
 
-        # repeate with script
+        # repeat with script
         assert_error {MISCONF *} {r test.rm_call eval {
             return redis.call('set','x',1)
             } 1 x
@@ -493,9 +546,48 @@ start_server {overrides {save {900 1}} tags {"modules"}} {
         # server is writable again
         r set x y
     } {OK}
+
+    test "malloc API" {
+        assert_equal {OK} [r test.malloc_api 0]
+    }
+
+    test "Cluster keyslot" {
+        assert_equal 12182 [r test.keyslot foo]
+    }
+
+    test "GetUsedMemoryRatioEstimate is 0 without maxmemory" {
+        r config set maxmemory 0
+        assert_equal 0 [r test.used_memory_ratio_estimate]
+        assert_equal 0 [r test.used_memory_ratio_estimate_bg]
+        assert_equal 0 [r test.used_memory_ratio]
+    }
+
+    test "GetUsedMemoryRatioEstimate tracks used_memory and maxmemory" {
+        set maxmemory [expr {[s used_memory] * 4}]
+        r config set maxmemory $maxmemory
+        set ratio [r test.used_memory_ratio_estimate]
+        set expected [expr {double([s used_memory]) / $maxmemory}]
+        assert_range $ratio [expr {$expected * 0.95}] [expr {$expected * 1.05}]
+
+        # Never smaller than RM_GetUsedMemoryRatio(), which subtracts the
+        # replication and AOF buffers. Allow for noise between the two calls.
+        set ratio_main [r test.used_memory_ratio]
+        assert_morethan_equal $ratio [expr {$ratio_main * 0.99}]
+
+        # A new maxmemory is reflected on the very next call.
+        r config set maxmemory [expr {$maxmemory * 2}]
+        set ratio_halved [r test.used_memory_ratio_estimate]
+        assert_range $ratio_halved [expr {$ratio / 2 * 0.95}] [expr {$ratio / 2 * 1.05}]
+
+        # Same value from a thread that does not hold the GIL.
+        set ratio_bg [r test.used_memory_ratio_estimate_bg]
+        assert_range $ratio_bg [expr {$ratio_halved * 0.95}] [expr {$ratio_halved * 1.05}]
+
+        r config set maxmemory 0
+    }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {test Dry Run - OK OOM/ACL} {
@@ -551,5 +643,51 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
 
     test "Unload the module - misc" {
         assert_equal {OK} [r module unload misc]
+    }
+}
+
+start_server {tags {"modules external:skip"}} {
+    test {Detect incompatible operations in cluster mode for module} {
+        r config set cluster-compatibility-sample-ratio 100
+        set incompatible_ops [s cluster_incompatible_ops]
+
+        # since test.no_cluster_cmd and its subcommand have 'no-cluster' flag,
+        # they should not be counted as incompatible ops, increment the counter by 2
+        r module load $testmodule
+        assert_equal [expr $incompatible_ops+2] [s cluster_incompatible_ops]
+
+        # incompatible_cluster_cmd is similar with MSET, check if it is counted as
+        # incompatible ops with different number of keys
+        # only 1 key, should not increment the counter
+        r test.incompatible_cluster_cmd foo bar
+        assert_equal [expr $incompatible_ops+2] [s cluster_incompatible_ops]
+        # 2 cross slot keys, should increment the counter
+        r test.incompatible_cluster_cmd foo bar bar foo
+        assert_equal [expr $incompatible_ops+3] [s cluster_incompatible_ops]
+        # 2 non cross slot keys, should not increment the counter
+        r test.incompatible_cluster_cmd foo bar bar{foo} bar
+        assert_equal [expr $incompatible_ops+3] [s cluster_incompatible_ops]
+    }
+}
+
+# The bitmap tags must sit on the server block: tag-filtered runs (e.g.
+# --tags bitmap) decide reachability from start_server tags before any
+# per-test tags are consulted.
+start_server {tags {"modules bitmap bitmap-roaring needs:debug external:skip cluster:skip"}} {
+    r module load $testmodule
+
+    test {module key API exposes bitmap without string access} {
+        set raw [binary format H* 80400100080000]
+
+        r set bitmap:module-boundary $raw
+        r set bitmap:module-string $raw
+        convert_string_bitmap_to_roaring r bitmap:module-boundary
+        assert_equal {bitmap 7 0 0} [r test.keyinfo bitmap:module-boundary]
+        assert_equal {string 7 1 1} [r test.keyinfo bitmap:module-string]
+        assert_equal bitmap [r type bitmap:module-boundary]
+        assert_equal $raw [r debug bitmap-raw bitmap:module-boundary]
+        assert_equal string [r type bitmap:module-string]
+        assert_equal $raw [r get bitmap:module-string]
+        assert_equal 2 [r del bitmap:module-boundary bitmap:module-string]
     }
 }

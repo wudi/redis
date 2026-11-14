@@ -1,42 +1,31 @@
 /*
- * Copyright (c) 2009-2020, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2020, Redis Labs, Inc
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
+ * Copyright (c) 2024-present, Valkey contributors.
+ * All rights reserved.
  *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
 #include "server.h"
+#include "bitroar.h"
 #include "util.h"
 #include "sha1.h"   /* SHA1 is used for DEBUG DIGEST */
 #include "crc64.h"
 #include "bio.h"
 #include "quicklist.h"
 #include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include "cluster.h"
+#include "zset_btree.h"
 #include "threads_mngr.h"
+#include "script.h"
+#include "cluster_asm.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -66,17 +55,112 @@ typedef ucontext_t sigcontext_t;
 
 /* Globals */
 static int bug_report_start = 0; /* True if bug report header was already logged. */
-static pthread_mutex_t bug_report_start_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t bug_report_start_mutex;
+static pthread_mutexattr_t bug_report_start_attr;
+
 /* Mutex for a case when two threads crash at the same time. */
 static pthread_mutex_t signal_handler_lock;
 static pthread_mutexattr_t signal_handler_lock_attr;
 static volatile int signal_handler_lock_initialized = 0;
+
+/* Crash watchdog: bounds a bug report so a stuck backtrace() or module info
+ * callback still exits. */
+/* Seconds a bug report may run; tests shorten it with
+ * DEBUG SET-CRASH-WATCHDOG-TIMEOUT. */
+static int crash_watchdog_timeout = 30;
+#ifdef HAVE_CRASH_WATCHDOG
+/* SIGRTMIN+4: glibc reserves +0..+2, and SIGALRM is the software watchdog. */
+#define CRASH_WATCHDOG_SIG (SIGRTMIN + 4)
+static timer_t crash_watchdog_timer;
+static int crash_watchdog_ok = 0;   /* the timer was created */
+
+/* The crash handler calls functions that are not async-signal-safe, like
+ * backtrace(), and we suspect they can deadlock. If the bug report doesn't
+ * finish in time, abort() so the process still terminates in a bounded time
+ * and a core dump is generated. Use abort(), not kill(): a signal sent to
+ * ourselves can be dropped. */
+static void crashWatchdogHandler(int sig) {
+    UNUSED(sig);
+    struct sigaction act;
+
+    /* No bug report running: a stray signal must not kill the server. */
+    if (!bug_report_start) return;
+
+    serverLogRawFromHandler(LL_WARNING|LL_RAW,
+"\n=== CRASH WATCHDOG: crash report exceeded its timeout ===\n"
+"    The bug report above is incomplete. Aborting so the process can be\n"
+"    restarted and a core dump produced.\n\n");
+
+    /* All of them, not only SIGABRT: glibc's fallback fault must not land
+     * back in sigsegvHandler(). */
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    act.sa_handler = SIG_DFL;
+    sigaction(SIGSEGV, &act, NULL);
+    sigaction(SIGBUS, &act, NULL);
+    sigaction(SIGFPE, &act, NULL);
+    sigaction(SIGILL, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
+    abort();
+}
+#endif
+
+/* Called at startup and in fork children (POSIX timers are not inherited). */
+void crashWatchdogInit(void) {
+#ifdef HAVE_CRASH_WATCHDOG
+    struct sigaction act;
+    struct sigevent sev;
+    sigset_t set;
+
+    /* Threads inherit the mask, and we may have been started with it blocked. */
+    sigemptyset(&set);
+    sigaddset(&set, CRASH_WATCHDOG_SIG);
+    pthread_sigmask(SIG_UNBLOCK, &set, NULL);
+
+    sigemptyset(&act.sa_mask);
+    /* A stray delivery must not return EINTR from unrelated syscalls. */
+    act.sa_flags = SA_RESTART;
+    act.sa_handler = crashWatchdogHandler;
+
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = CRASH_WATCHDOG_SIG;
+
+    /* Without the flag, crashWatchdogSet() would use an unset timer_t, which
+     * can name a timer someone else created. */
+    crash_watchdog_ok = sigaction(CRASH_WATCHDOG_SIG, &act, NULL) == 0 &&
+                        timer_create(CLOCK_MONOTONIC, &sev, &crash_watchdog_timer) == 0;
+    if (!crash_watchdog_ok)
+        serverLog(LL_WARNING, "Crash watchdog disabled: %s", strerror(errno));
+#endif
+}
+
+/* Arm the deadline, or disarm it with 0. */
+static void crashWatchdogSet(int seconds) {
+#ifdef HAVE_CRASH_WATCHDOG
+    if (!crash_watchdog_ok) return;
+    struct itimerspec its = {{0, 0}, {seconds, 0}};
+    timer_settime(crash_watchdog_timer, 0, &its, NULL);
+#else
+    UNUSED(seconds);
+#endif
+}
+
+/* Arm the deadline unless it is already counting down. */
+static void crashWatchdogArmIfIdle(void) {
+#ifdef HAVE_CRASH_WATCHDOG
+    struct itimerspec cur = {{0, 0}, {0, 0}};
+    if (crash_watchdog_ok && timer_gettime(crash_watchdog_timer, &cur) == 0 &&
+        (cur.it_value.tv_sec || cur.it_value.tv_nsec)) return;
+#endif
+    crashWatchdogSet(crash_watchdog_timeout);
+}
+
 /* Forward declarations */
 int bugReportStart(void);
 void printCrashReport(void);
 void bugReportEnd(int killViaSignal, int sig);
 void logStackTrace(void *eip, int uplevel, int current_thread);
-void dbGetStats(char *buf, size_t bufsize, redisDb *db, int full, dbKeyType keyType);
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret);
 
 /* ================================= Debugging ============================== */
@@ -135,6 +219,43 @@ void mixStringObjectDigest(unsigned char *digest, robj *o) {
     decrRefCount(o);
 }
 
+/* Stream one [start, end) set-bit run into the bitmap SHA1 as two fixed-width
+ * little-endian integers. */
+static void mixBitmapObjectRangeDigest(uint64_t start, uint64_t end, void *privdata) {
+    SHA1_CTX *ctx = privdata;
+    uint64_t range[2] = {intrev64ifbe(start), intrev64ifbe(end)};
+
+    SHA1Update(ctx, (unsigned char *)range, sizeof(range));
+}
+
+void mixBitmapObjectDigest(unsigned char *digest, robj *o) {
+    /* Digest Roaring bitmaps by logical length plus canonical set-bit ranges.
+     * This avoids materializing sparse high-offset bitmaps and keeps the
+     * digest independent from CRoaring's history-dependent container choices.
+     * All the ranges are streamed into a single SHA1 that is mixed into the
+     * digest once, so each run costs one 16-byte SHA1Update rather than two
+     * mixDigest() calls with a SHA1 finalization each. */
+    SHA1_CTX ctx;
+    unsigned char hash[20];
+    uint64_t len = intrev64ifbe(bitroarLen(o));
+
+    SHA1Init(&ctx);
+    SHA1Update(&ctx, (unsigned char *)&len, sizeof(len));
+    bitroarVisitSetBitRanges(o, mixBitmapObjectRangeDigest, &ctx);
+    SHA1Final(hash, &ctx);
+    mixDigest(digest, hash, sizeof(hash));
+}
+
+#ifdef ENABLE_GCRA
+void mixGCRAObjectDigest(unsigned char *digest, robj *o) {
+    char buf[LONG_STR_SIZE];
+    long long val;
+    getLongLongFromGCRAObject(o, &val);
+    int len = ll2string(buf, sizeof(buf), val);
+    mixDigest(digest,buf,len);
+}
+#endif
+
 /* This function computes the digest of a data structure stored in the
  * object 'o'. It is the core of the DEBUG DIGEST command: when taking the
  * digest of a whole dataset, we take the digest of the key and the value
@@ -146,32 +267,43 @@ void mixStringObjectDigest(unsigned char *digest, robj *o) {
 void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) {
     uint32_t aux = htonl(o->type);
     mixDigest(digest,&aux,sizeof(aux));
-    long long expiretime = getExpire(db,keyobj);
+    long long expiretime = getExpire(db, keyobj->ptr, NULL);
     char buf[128];
 
     /* Save the key and associated value */
     if (o->type == OBJ_STRING) {
         mixStringObjectDigest(digest,o);
     } else if (o->type == OBJ_LIST) {
-        listTypeIterator *li = listTypeInitIterator(o,0,LIST_TAIL);
+        listTypeIterator li;
         listTypeEntry entry;
-        while(listTypeNext(li,&entry)) {
+        listTypeInitIterator(&li, o, 0, LIST_TAIL);
+        while(listTypeNext(&li, &entry)) {
             robj *eleobj = listTypeGet(&entry);
             mixStringObjectDigest(digest,eleobj);
             decrRefCount(eleobj);
         }
-        listTypeReleaseIterator(li);
+        listTypeResetIterator(&li);
     } else if (o->type == OBJ_SET) {
-        setTypeIterator *si = setTypeInitIterator(o);
+        setTypeIterator si;
         sds sdsele;
-        while((sdsele = setTypeNextObject(si)) != NULL) {
-            xorDigest(digest,sdsele,sdslen(sdsele));
+        setTypeInitIterator(&si, o, SET_ITER_RAW);
+        while((sdsele = setTypeNextObject(&si)) != NULL) {
+            if (si.expire == EB_EXPIRE_TIME_INVALID) {
+                xorDigest(digest,sdsele,sdslen(sdsele));
+            } else {
+                /* A member with an expiration (SME) */
+                unsigned char eledigest[20];
+                memset(eledigest,0,20);
+                mixDigest(eledigest,sdsele,sdslen(sdsele));
+                xorDigest(eledigest,"!!sexpire!!",11);
+                xorDigest(digest,eledigest,20);
+            }
             sdsfree(sdsele);
         }
-        setTypeReleaseIterator(si);
+        setTypeResetIterator(&si);
     } else if (o->type == OBJ_ZSET) {
         unsigned char eledigest[20];
-
+        if (zsetLength(o) == 0) return;
         if (o->encoding == OBJ_ENCODING_LISTPACK) {
             unsigned char *zl = o->ptr;
             unsigned char *eptr, *sptr;
@@ -204,39 +336,60 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         } else if (o->encoding == OBJ_ENCODING_SKIPLIST) {
             zset *zs = o->ptr;
-            dictIterator *di = dictGetIterator(zs->dict);
+            dictIterator di;
             dictEntry *de;
 
-            while((de = dictNext(di)) != NULL) {
-                sds sdsele = dictGetKey(de);
-                double *score = dictGetVal(de);
-                const int len = fpconv_dtoa(*score, buf);
+            dictInitIterator(&di, zs->dict);
+            while((de = dictNext(&di)) != NULL) {
+                zskiplistNode *znode = dictGetKey(de);
+                sds sdsele = zslGetNodeElement(znode);
+                const int len = fpconv_dtoa(znode->score, buf);
                 buf[len] = '\0';
                 memset(eledigest,0,20);
                 mixDigest(eledigest,sdsele,sdslen(sdsele));
                 mixDigest(eledigest,buf,strlen(buf));
                 xorDigest(digest,eledigest,20);
             }
-            dictReleaseIterator(di);
+            dictResetIterator(&di);
+        } else if (o->encoding == OBJ_ENCODING_BTREE) {
+            zbtreeIterator iter;
+            const unsigned char *ele;
+            size_t elelen;
+            double score;
+            zbtreeIteratorStart(o->ptr, 0, &iter);
+            while (zbtreeIteratorNext(&iter, 0, &ele, &elelen, &score)) {
+                const int len = fpconv_dtoa(score, buf);
+                buf[len] = '\0';
+                memset(eledigest,0,20);
+                mixDigest(eledigest,ele,elelen);
+                mixDigest(eledigest,buf,strlen(buf));
+                xorDigest(digest,eledigest,20);
+            }
         } else {
             serverPanic("Unknown sorted set encoding");
         }
     } else if (o->type == OBJ_HASH) {
-        hashTypeIterator *hi = hashTypeInitIterator(o);
-        while (hashTypeNext(hi) != C_ERR) {
+        hashTypeIterator hi;
+        hashTypeInitIterator(&hi, o);
+        while (hashTypeNext(&hi, 0) != C_ERR) {
             unsigned char eledigest[20];
             sds sdsele;
 
+            /* field */
             memset(eledigest,0,20);
-            sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_KEY);
+            sdsele = hashTypeCurrentObjectNewSds(&hi,OBJ_HASH_KEY);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
-            sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_VALUE);
+            /* val */
+            sdsele = hashTypeCurrentObjectNewSds(&hi,OBJ_HASH_VALUE);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
+            /* hash-field expiration (HFE) */
+            if (hi.expire_time != EB_EXPIRE_TIME_INVALID)
+                xorDigest(eledigest,"!!hexpire!!",11);
             xorDigest(digest,eledigest,20);
         }
-        hashTypeReleaseIterator(hi);
+        hashTypeResetIterator(&hi);
     } else if (o->type == OBJ_STREAM) {
         streamIterator si;
         streamIteratorStart(&si,o->ptr,NULL,NULL,0);
@@ -258,6 +411,10 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         }
         streamIteratorStop(&si);
+#ifdef ENABLE_GCRA
+    } else if (o->type == OBJ_GCRA) {
+        mixGCRAObjectDigest(digest, o);
+#endif
     } else if (o->type == OBJ_MODULE) {
         RedisModuleDigest md = {{0},{0},keyobj,db->id};
         moduleValue *mv = o->ptr;
@@ -267,6 +424,23 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             mt->digest(&md,mv->value);
             xorDigest(digest,md.x,sizeof(md.x));
         }
+    } else if (o->type == OBJ_ARRAY) {
+        redisArray *ar = o->ptr;
+        uint64_t len = arLen(ar);
+        for (uint64_t idx = 0; idx < len; idx++) {
+            void *v = arGet(ar, idx);
+            if (arIsEmpty(v)) {
+                /* For empty slots, contribute "(null)" */
+                mixDigest(digest, "(null)", 6);
+            } else {
+                char vbuf[AR_INLINE_BUFSIZE];
+                size_t vlen;
+                const char *data = arDecode(v, vbuf, sizeof(vbuf), &vlen);
+                mixDigest(digest, data, vlen);
+            }
+        }
+    } else if (o->type == OBJ_BITMAP) {
+        mixBitmapObjectDigest(digest, o);
     } else {
         serverPanic("Unknown object type");
     }
@@ -290,32 +464,33 @@ void computeDatasetDigest(unsigned char *final) {
 
     for (j = 0; j < server.dbnum; j++) {
         redisDb *db = server.db+j;
-        if (dbSize(db, DB_MAIN) == 0) continue;
-        dbIterator *dbit = dbIteratorInit(db, DB_MAIN);
+        if (kvstoreSize(db->keys) == 0)
+            continue;
 
         /* hash the DB id, so the same dataset moved in a different DB will lead to a different digest */
         aux = htonl(j);
         mixDigest(final,&aux,sizeof(aux));
 
         /* Iterate this DB writing every entry */
-        while((de = dbIteratorNext(dbit)) != NULL) {
-            sds key;
-            robj *keyobj, *o;
+        kvstoreIterator kvs_it;
+        kvstoreIteratorInit(&kvs_it, db->keys);
+        while((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
+            robj *keyobj;
 
             memset(digest,0,20); /* This key-val digest */
-            key = dictGetKey(de);
+            kvobj *kv = dictGetKV(de);
+            sds key = kvobjGetKey(kv);
             keyobj = createStringObject(key,sdslen(key));
 
             mixDigest(digest,key,sdslen(key));
 
-            o = dictGetVal(de);
-            xorObjectDigest(db,keyobj,digest,o);
+            xorObjectDigest(db, keyobj, digest, kv);
 
             /* We can finally xor the key-val digest to the final digest */
             xorDigest(final,digest,20);
             decrRefCount(keyobj);
         }
-        dbReleaseIterator(dbit);
+        kvstoreIteratorReset(&kvs_it);
     }
 }
 
@@ -395,8 +570,13 @@ void debugCommand(client *c) {
         const char *help[] = {
 "AOF-FLUSH-SLEEP <microsec>",
 "    Server will sleep before flushing the AOF, this is used for testing.",
+"AOF-FLUSH-FORCE <ERROR|STALL> <0|1>",
+"    ERROR: force the AOF flush to fail (set the AOF write error status).",
+"    STALL: skip the AOF flush so the durable offset stalls (no error).",
 "ASSERT",
 "    Crash by assertion failed.",
+"BITMAP-RAW <key>",
+"    Return the raw byte materialization of a Roaring bitmap key.",
 "CHANGE-REPL-ID",
 "    Change the replication IDs of the instance.",
 "    Dangerous: should be used only for testing the replication subsystem.",
@@ -407,6 +587,8 @@ void debugCommand(client *c) {
 "    Hard crash and restart after a <milliseconds> delay (default 0).",
 "DIGEST",
 "    Output a hex signature representing the current DB content.",
+"INTERNAL_SECRET",
+"    Return the cluster internal secret (hashed with crc16) or error if not in cluster mode.",
 "DIGEST-VALUE <key> [<key> ...]",
 "    Output a hex signature of the values of all the specified keys.",
 "ERROR <string>",
@@ -416,10 +598,20 @@ void debugCommand(client *c) {
 "    Create a memory leak of the input string.",
 "LOG <message>",
 "    Write <message> to the server log.",
+"DEFRAG-FRAG-CACHE-STATS",
+"    Return hits counters for the defrag-side fragmentation cache.",
 "HTSTATS <dbid> [full]",
 "    Return hash table statistics of the specified Redis database.",
 "HTSTATS-KEY <key> [full]",
 "    Like HTSTATS but for the hash table stored at <key>'s value.",
+"KEYSIZES-HIST-ASSERT <0|1>",
+"    Enable/disable keysizes histogram assertion after each command.",
+"STREAM-STATS-ASSERT <0|1>",
+"    Enable/disable INFO streams histogram assertion after each command.",
+"    Arm on an exact state: tracking enabled at startup, an empty keyspace,",
+"    or right after DEBUG RELOAD; a runtime enable fills in lazily.",
+"KEYMETA-AOF-DUMP <key>",
+"    Return a DUMP payload without KeyMeta for an AOF rewrite.",
 "LOADAOF",
 "    Flush the AOF buffers on disk and reload the AOF in memory.",
 "REPLICATE <string>",
@@ -434,6 +626,8 @@ void debugCommand(client *c) {
 "    Show low level info about `key` and associated value.",
 "DROP-CLUSTER-PACKET-FILTER <packet-type>",
 "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
+"ENABLE-KEYMETA-RUNTIME-REGISTRATION <0|1>",
+"    Allow keymeta class registration outside server startup (for testing).",
 "OOM",
 "    Crash the server simulating an out-of-memory error.",
 "PANIC",
@@ -467,9 +661,15 @@ void debugCommand(client *c) {
 "SEGFAULT",
 "    Crash the server with sigsegv.",
 "SET-ACTIVE-EXPIRE <0|1>",
-"    Setting it to 0 disables expiring keys in background when they are not",
-"    accessed (otherwise the Redis behavior). Setting it to 1 reenables back the",
-"    default.",
+"    Setting it to 0 disables expiring keys (and hash-fields) in background ",
+"    when they are not accessed (otherwise the Redis behavior). Setting it",
+"    to 1 reenables back the default.",
+"SET-ALLOW-ACCESS-EXPIRED <0|1>",
+"    Setting it to 0 prevents access to expired keys (and hash-fields),",
+"    simulating the standard Redis behavior. Setting it to 1 allows",
+"    access to expired keys (and hash-fields) without triggering deletion.",
+"SET-CRASH-WATCHDOG-TIMEOUT <seconds>",
+"    Seconds a crash report may run before the process is aborted (default 30).",
 "QUICKLIST-PACKED-THRESHOLD <size>",
 "    Sets the threshold for elements to be inserted as plain vs packed nodes",
 "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
@@ -496,6 +696,24 @@ void debugCommand(client *c) {
 "    In case RESET is provided the peak reset time will be restored to the default value",
 "REPLYBUFFER RESIZING <0|1>",
 "    Enable or disable the reply buffer resize cron job",
+"REPLY-COPY-AVOIDANCE <0|1>",
+"    Enable/disable reply copy avoidance optimization.",
+"REPL-PAUSE <clear|after-fork|before-rdb-channel|on-streaming-repl-buf>",
+"    Pause the server's main process during various replication steps.",
+"DICT-RESIZING <0|1>",
+"    Enable or disable the main dict and expire dict resizing.",
+"HOTKEYS-SHIFT-START <milliseconds>",
+"    Move the start of the current HOTKEYS tracking <milliseconds> into the past.",
+"SCRIPT <LIST|<sha>>",
+"    Output SHA and content of all scripts or of a specific script with its SHA.",
+"MARK-INTERNAL-CLIENT [UNMARK]",
+"    Promote the current connection to an internal connection.",
+"ASM-FAILPOINT <channel> <state>",
+"    Set a fail point for the specified channel and state for cluster atomic slot migration.",
+"ASM-TRIM-METHOD <default|none|active|bg> <active-trim-delay> ",
+"    Disable trimming or force active/background trimming for cluster atomic slot migration.",
+"    Active trim delay is used only when method is 'active'. If it is negative,",
+"    active trim is disabled.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -527,6 +745,33 @@ NULL
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"assert")) {
         serverAssertWithInfo(c,c->argv[0],1 == 2);
+    } else if (!strcasecmp(c->argv[1]->ptr,"KEYSIZES-HIST-ASSERT") && c->argc == 3) {
+        long long flag;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &flag, NULL) != C_OK)
+            return;
+        if (flag)
+            server.dbg_assert_flags |= DBG_ASSERT_KEYSIZES;
+        else
+            server.dbg_assert_flags &= ~DBG_ASSERT_KEYSIZES;
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"STREAM-STATS-ASSERT") && c->argc == 3) {
+        long long flag;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &flag, NULL) != C_OK)
+            return;
+        if (flag)
+            server.dbg_assert_flags |= DBG_ASSERT_STREAM_STATS;
+        else
+            server.dbg_assert_flags &= ~DBG_ASSERT_STREAM_STATS;
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"ALLOCSIZE-SLOTS-ASSERT") && c->argc == 3) {
+        long long flag;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &flag, NULL) != C_OK)
+            return;
+        if (flag)
+            server.dbg_assert_flags |= DBG_ASSERT_ALLOC_SLOT;
+        else
+            server.dbg_assert_flags &= ~DBG_ASSERT_ALLOC_SLOT;
+        addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char*)c->argv[2]->ptr);
         addReply(c,shared.ok);
@@ -554,6 +799,15 @@ NULL
             }
         }
 
+        /* A background saver can replace the snapshot between our synchronous
+         * save and load, rolling the dataset back to the child's fork time. */
+        if (save && server.child_type == CHILD_TYPE_RDB) {
+            addReplyError(c,"Background save already in progress");
+            return;
+        }
+
+        backupSetFailed("debug reload executed");
+
         /* The default behavior is to save the RDB file before loading
          * it back. */
         if (save) {
@@ -577,9 +831,11 @@ NULL
             addReplyError(c,"Error trying to load the RDB dump, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         serverLog(LL_NOTICE,"DB reloaded by DEBUG RELOAD");
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"loadaof")) {
+        backupSetFailed("debug loadaof executed");
         if (server.aof_state != AOF_OFF) flushAppendOnlyFile(1);
         emptyData(-1,EMPTYDB_NO_FLAGS,NULL);
         protectClient(c);
@@ -592,6 +848,7 @@ NULL
             addReplyError(c, "Error trying to load the AOF files, check server logs.");
             return;
         }
+        applyAppendOnlyConfig(); /* Check if AOF config was changed while loading */
         server.dirty = 0; /* Prevent AOF / replication */
         serverLog(LL_NOTICE,"Append Only File loaded by DEBUG LOADAOF");
         addReply(c,shared.ok);
@@ -602,22 +859,21 @@ NULL
         server.cluster_drop_packet_filter = packet_type;
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
-        dictEntry *de;
-        robj *val;
+        kvobj *kv;
         char *strenc;
 
-        if ((de = dbFind(c->db, c->argv[2]->ptr, DB_MAIN)) == NULL) {
+        if ((kv = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
-        val = dictGetVal(de);
-        strenc = strEncoding(val->encoding);
+
+        strenc = strEncoding(kv->encoding);
 
         char extra[138] = {0};
-        if (val->encoding == OBJ_ENCODING_QUICKLIST) {
+        if (kv->encoding == OBJ_ENCODING_QUICKLIST) {
             char *nextra = extra;
             int remaining = sizeof(extra);
-            quicklist *ql = val->ptr;
+            quicklist *ql = kv->ptr;
             /* Add number of quicklist nodes */
             int used = snprintf(nextra, remaining, " ql_nodes:%lu", ql->len);
             nextra += used;
@@ -650,50 +906,68 @@ NULL
             "Value at:%p refcount:%d "
             "encoding:%s serializedlength:%zu "
             "lru:%d lru_seconds_idle:%llu%s",
-            (void*)val, val->refcount,
-            strenc, rdbSavedObjectLen(val, c->argv[2], c->db->id),
-            val->lru, estimateObjectIdleTime(val)/1000, extra);
+            (void*)kv, kv->refcount,
+            strenc, rdbSavedObjectLen(kv, c->argv[2], c->db->id),
+            kv->lru, estimateObjectIdleTime(kv)/1000, extra);
+    } else if (!strcasecmp(c->argv[1]->ptr,"keymeta-aof-dump") && c->argc == 3) {
+        kvobj *kv = dbFind(c->db, c->argv[2]->ptr);
+        if (kv == NULL) {
+            addReplyNull(c);
+            return;
+        }
+
+        rio payload;
+        createDumpPayload(&payload, kv, c->argv[2], c->db->id, DUMP_PAYLOAD_SKIP_KEY_META, 0);
+        addReplyBulkSds(c, payload.io.buffer.ptr);
     } else if (!strcasecmp(c->argv[1]->ptr,"sdslen") && c->argc == 3) {
-        dictEntry *de;
         robj *val;
         sds key;
+        kvobj *kv;
 
-        if ((de = dbFind(c->db, c->argv[2]->ptr, DB_MAIN)) == NULL) {
+        if ((kv = dbFind(c->db, c->argv[2]->ptr)) == NULL) {
             addReplyErrorObject(c,shared.nokeyerr);
             return;
         }
-        val = dictGetVal(de);
-        key = dictGetKey(de);
-
-        if (val->type != OBJ_STRING || !sdsEncodedObject(val)) {
+        
+        val = kv;
+        key = kvobjGetKey(kv);
+        if (kv->type != OBJ_STRING || !sdsEncodedObject(val)) {
             addReplyError(c,"Not an sds encoded string.");
         } else {
+            /* The key's allocation size reflects the entire robj allocation.  
+             * For embedded values, report an allocation size of 0. */
+            size_t obj_alloc = zmalloc_usable_size(val);
+            size_t val_alloc = val->encoding == OBJ_ENCODING_RAW ? sdsAllocSize(val->ptr) : 0;
             addReplyStatusFormat(c,
                 "key_sds_len:%lld, key_sds_avail:%lld, key_zmalloc: %lld, "
                 "val_sds_len:%lld, val_sds_avail:%lld, val_zmalloc: %lld",
                 (long long) sdslen(key),
                 (long long) sdsavail(key),
-                (long long) sdsZmallocSize(key),
+                (long long) obj_alloc,
                 (long long) sdslen(val->ptr),
                 (long long) sdsavail(val->ptr),
-                (long long) getStringObjectSdsUsedMemory(val));
+                (long long) val_alloc);
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"listpack") && c->argc == 3) {
-        robj *o;
+        kvobj *o;
 
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
+        if ((o = kvobjCommandLookupOrReply(c, c->argv[2], shared.nokeyerr))
                 == NULL) return;
 
-        if (o->encoding != OBJ_ENCODING_LISTPACK) {
+        if (o->encoding != OBJ_ENCODING_LISTPACK && o->encoding != OBJ_ENCODING_LISTPACK_EX) {
             addReplyError(c,"Not a listpack encoded object.");
         } else {
-            lpRepr(o->ptr);
+            if (o->encoding == OBJ_ENCODING_LISTPACK)
+                lpRepr(o->ptr);
+            else if (o->encoding == OBJ_ENCODING_LISTPACK_EX)
+                lpRepr(((listpackEx*)o->ptr)->lp);
+
             addReplyStatus(c,"Listpack structure printed on stdout");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"quicklist") && (c->argc == 3 || c->argc == 4)) {
-        robj *o;
+        kvobj *o;
 
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
+        if ((o = kvobjCommandLookupOrReply(c, c->argv[2], shared.nokeyerr))
             == NULL) return;
 
         int full = 0;
@@ -719,7 +993,7 @@ NULL
             return;
         }
 
-        if (dbExpand(c->db, keys, DB_MAIN, 1) == C_ERR) {
+        if (dbExpand(c->db, keys, 1) == C_ERR) {
             addReplyError(c, "OOM in dictTryExpand");
             return;
         }
@@ -743,8 +1017,8 @@ NULL
                 val = createStringObject(NULL,valsize);
                 memcpy(val->ptr, buf, valsize<=buflen? valsize: buflen);
             }
-            dbAdd(c->db,key,val);
-            signalModifiedKey(c,c->db,key);
+            dbAdd(c->db, key, &val);
+            keyModified(c,c->db,key,val,1);
             decrRefCount(key);
         }
         addReply(c,shared.ok);
@@ -757,6 +1031,15 @@ NULL
         for (int i = 0; i < 20; i++) d = sdscatprintf(d, "%02x",digest[i]);
         addReplyStatus(c,d);
         sdsfree(d);
+    } else if (!strcasecmp(c->argv[1]->ptr,"internal_secret") && c->argc == 2) {
+        size_t len;
+        const char *internal_secret = clusterGetSecret(&len);
+        if (!internal_secret) {
+            addReplyError(c, "Internal secret is missing");
+        } else {
+            uint16_t hash = crc16(internal_secret, len);
+            addReplyLongLong(c, hash);
+        }
     } else if (!strcasecmp(c->argv[1]->ptr,"digest-value") && c->argc >= 2) {
         /* DEBUG DIGEST-VALUE key key key ... key. */
         addReplyArrayLen(c,c->argc-2);
@@ -766,8 +1049,7 @@ NULL
 
             /* We don't use lookupKey because a debug command should
              * work on logically expired keys */
-            dictEntry *de;
-            robj *o = ((de = dbFind(c->db, c->argv[j]->ptr, DB_MAIN)) == NULL) ? NULL : dictGetVal(de);
+            kvobj *o = dbFind(c->db, c->argv[j]->ptr);
             if (o) xorObjectDigest(c->db,c->argv[j],digest,o);
 
             sds d = sdsempty();
@@ -837,7 +1119,7 @@ NULL
             addReplyError(c,"Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"sleep") && c->argc == 3) {
-        double dtime = strtod(c->argv[2]->ptr,NULL);
+        double dtime = fast_float_strtod(c->argv[2]->ptr,sdslen(c->argv[2]->ptr),NULL);
         long long utime = dtime*1000000;
         struct timespec tv;
 
@@ -850,12 +1132,25 @@ NULL
     {
         server.active_expire_enabled = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"set-crash-watchdog-timeout") &&
+               c->argc == 3)
+    {
+        long seconds;
+        if (getRangeLongFromObjectOrReply(c, c->argv[2], 1, INT_MAX, &seconds, NULL) != C_OK)
+            return;
+        crash_watchdog_timeout = seconds;
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"set-allow-access-expired") &&
+               c->argc == 3)
+    {
+        server.allow_access_expired = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"quicklist-packed-threshold") &&
                c->argc == 3)
     {
         int memerr;
         unsigned long long sz = memtoull((const char *)c->argv[2]->ptr, &memerr);
-        if (memerr || !quicklistisSetPackedThreshold(sz)) {
+        if (memerr || !quicklistSetPackedThreshold(sz)) {
             addReplyError(c, "argument must be a memory value bigger than 1 and smaller than 4gb");
         } else {
             addReply(c,shared.ok);
@@ -865,10 +1160,35 @@ NULL
     {
         server.skip_checksum_validation = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"bitmap-raw") && c->argc == 3) {
+        kvobj *kv = lookupKeyReadOrReply(c, c->argv[2], shared.nokeyerr);
+        if (kv == NULL || checkType(c, kv, OBJ_BITMAP)) return;
+
+        sds raw = bitroarMaterializeForDebug(kv);
+        if (raw == NULL) {
+            addReplyError(c, "bitmap length exceeds proto-max-bulk-len, cannot materialize");
+            return;
+        }
+        addReplyBulkSds(c, raw);
+    } else if (!strcasecmp(c->argv[1]->ptr,"enable-keymeta-runtime-registration") &&
+               c->argc == 3)
+    {
+        server.allow_keymeta_registration = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"aof-flush-sleep") &&
                c->argc == 3)
     {
         server.aof_flush_sleep = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"aof-flush-force") && c->argc == 4) {
+        if (!strcasecmp(c->argv[2]->ptr,"error")) {
+            server.aof_flush_force_error = atoi(c->argv[3]->ptr);
+        } else if (!strcasecmp(c->argv[2]->ptr,"stall")) {
+            server.aof_flush_force_stall = atoi(c->argv[3]->ptr);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"replicate") && c->argc >= 3) {
         replicationFeedSlaves(server.slaves, -1,
@@ -885,13 +1205,18 @@ NULL
         sds sizes = sdsempty();
         sizes = sdscatprintf(sizes,"bits:%d ",(sizeof(void*) == 8)?64:32);
         sizes = sdscatprintf(sizes,"robj:%d ",(int)sizeof(robj));
-        sizes = sdscatprintf(sizes,"dictentry:%d ",(int)dictEntryMemUsage());
+        sizes = sdscatprintf(sizes,"dictentry:%d ",(int)dictEntryMemUsage(0));
         sizes = sdscatprintf(sizes,"sdshdr5:%d ",(int)sizeof(struct sdshdr5));
         sizes = sdscatprintf(sizes,"sdshdr8:%d ",(int)sizeof(struct sdshdr8));
         sizes = sdscatprintf(sizes,"sdshdr16:%d ",(int)sizeof(struct sdshdr16));
         sizes = sdscatprintf(sizes,"sdshdr32:%d ",(int)sizeof(struct sdshdr32));
         sizes = sdscatprintf(sizes,"sdshdr64:%d ",(int)sizeof(struct sdshdr64));
         addReplyBulkSds(c,sizes);
+    } else if (!strcasecmp(c->argv[1]->ptr,"defrag-frag-cache-stats")) {
+        sds stats = sdsempty();
+        stats = sdscatprintf(stats, "defrag_frag_cache_hits:%lld\r\n", server.defrag_frag_cache.hits);
+        addReplyVerbatim(c,stats,sdslen(stats),"txt");
+        sdsfree(stats);
     } else if (!strcasecmp(c->argv[1]->ptr,"htstats") && c->argc >= 3) {
         long dbid;
         sds stats = sdsempty();
@@ -911,24 +1236,24 @@ NULL
             full = 1;
 
         stats = sdscatprintf(stats,"[Dictionary HT]\n");
-        dbGetStats(buf, sizeof(buf), &server.db[dbid], full, DB_MAIN);
+        kvstoreGetStats(server.db[dbid].keys, buf, sizeof(buf), full);
         stats = sdscat(stats,buf);
 
         stats = sdscatprintf(stats,"[Expires HT]\n");
-        dbGetStats(buf, sizeof(buf), &server.db[dbid], full, DB_EXPIRES);
+        kvstoreGetStats(server.db[dbid].expires, buf, sizeof(buf), full);
         stats = sdscat(stats,buf);
 
         addReplyVerbatim(c,stats,sdslen(stats),"txt");
         sdsfree(stats);
     } else if (!strcasecmp(c->argv[1]->ptr,"htstats-key") && c->argc >= 3) {
-        robj *o;
+        kvobj *o;
         dict *ht = NULL;
         int full = 0;
 
         if (c->argc >= 4 && !strcasecmp(c->argv[3]->ptr,"full"))
             full = 1;
 
-        if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
+        if ((o = kvobjCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
 
         /* Get the hash table reference from the object, if possible. */
@@ -1004,6 +1329,15 @@ NULL
     {
         server.pause_cron = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"hotkeys-shift-start") && c->argc == 3) {
+        long long ms;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &ms, NULL) != C_OK) return;
+        if (!server.hotkeys) {
+            addReplyError(c, "HOTKEYS tracking was not started");
+            return;
+        }
+        server.hotkeys->start -= ms;
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"replybuffer") && c->argc == 4 ) {
         if(!strcasecmp(c->argv[2]->ptr, "peak-reset-time")) {
             if (!strcasecmp(c->argv[3]->ptr, "never")) {
@@ -1021,6 +1355,78 @@ NULL
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"reply-copy-avoidance") && c->argc == 3) {
+        server.reply_copy_avoidance_enabled = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "repl-pause") && c->argc == 3) {
+        if (!strcasecmp(c->argv[2]->ptr, "clear")) {
+            server.repl_debug_pause = REPL_DEBUG_PAUSE_NONE;
+        } else if (!strcasecmp(c->argv[2]->ptr,"after-fork")) {
+            server.repl_debug_pause |= REPL_DEBUG_AFTER_FORK;
+        } else if (!strcasecmp(c->argv[2]->ptr,"before-rdb-channel")) {
+            server.repl_debug_pause |= REPL_DEBUG_BEFORE_RDB_CHANNEL;
+        } else if (!strcasecmp(c->argv[2]->ptr, "on-streaming-repl-buf")) {
+            server.repl_debug_pause |= REPL_DEBUG_ON_STREAMING_REPL_BUF;
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr, "dict-resizing") && c->argc == 3) {
+        server.dict_resizing = atoi(c->argv[2]->ptr);
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"script") && c->argc == 3) {
+        if (server.hide_user_data_from_log) {
+            addReplyError(c, "DEBUG SCRIPT is disabled when hide-user-data-from-log is enabled");
+            return;
+        }
+        if (!strcasecmp(c->argv[2]->ptr,"list")) {
+            dictIterator di;
+            dictEntry *de;
+            dictInitIterator(&di, evalScriptsDict());
+            while ((de = dictNext(&di)) != NULL) {
+                luaScript *script = dictGetVal(de);
+                sds *sha = dictGetKey(de);
+                serverLog(LL_WARNING, "SCRIPT SHA: %s\n%s", (char*)sha, (char*)script->body->ptr);
+            }
+            dictResetIterator(&di);
+        } else if (sdslen(c->argv[2]->ptr) == 40) {
+            dictEntry *de;
+            if ((de = dictFind(evalScriptsDict(), c->argv[2]->ptr)) == NULL) {
+                addReplyErrorObject(c, shared.noscripterr);
+                return;
+            }
+            luaScript *script = dictGetVal(de);
+            serverLog(LL_WARNING, "SCRIPT SHA: %s\n%s", (char*)c->argv[2]->ptr, (char*)script->body->ptr);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+        addReply(c,shared.ok);
+    } else if(!strcasecmp(c->argv[1]->ptr,"mark-internal-client") && c->argc < 4) {
+        if (c->argc == 2) {
+            c->flags |= CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else if (c->argc == 3 && !strcasecmp(c->argv[2]->ptr, "unmark")) {
+            c->flags &= ~CLIENT_INTERNAL;
+            addReply(c, shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
+            return;
+        }
+    } else if(!strcasecmp(c->argv[1]->ptr,"asm-failpoint") && c->argc == 4) {
+        if (asmDebugSetFailPoint(c->argv[2]->ptr, c->argv[3]->ptr) != C_OK) {
+            addReplyError(c, "Failed to set ASM fail point");
+        } else {
+            addReply(c, shared.ok);
+        }
+    } else if(!strcasecmp(c->argv[1]->ptr,"asm-trim-method") && c->argc >= 3) {
+        int delay = c->argc == 4 ? atoi(c->argv[3]->ptr) : 0;
+        if (asmDebugSetTrimMethod(c->argv[2]->ptr, delay) != C_OK) {
+            addReplyError(c, "Failed to set ASM trim method");
+        } else {
+            addReply(c, shared.ok);
+        }
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
         return;
@@ -1028,6 +1434,46 @@ NULL
 }
 
 /* =========================== Crash handling  ============================== */
+
+/* When hide-user-data-from-log is enabled, to avoid leaking user info, we only
+ * print tokens of the current command into the log. First, we collect command
+ * tokens into this struct (Commands tokens are defined in json schema). Later,
+ * checking each argument against the token list. */
+#define CMD_TOKEN_MAX_COUNT 128 /* Max token count in a command's json schema */
+struct cmdToken {
+    const char *tokens[CMD_TOKEN_MAX_COUNT];
+    int n_token;
+};
+
+/* Collect tokens from command arguments recursively. */
+static void cmdTokenCollect(struct cmdToken *tk, redisCommandArg *args, int argc) {
+    if (args == NULL)
+        return;
+
+    for (int i = 0; i < argc && tk->n_token < CMD_TOKEN_MAX_COUNT; i++) {
+        if (args[i].token)
+            tk->tokens[tk->n_token++] = args[i].token;
+        cmdTokenCollect(tk, args[i].subargs, args[i].num_args);
+    }
+}
+
+/* Get tokens of the command. */
+static void cmdTokenGetFromCommand(struct cmdToken *tk, struct redisCommand *cmd) {
+    tk->n_token = 0;
+    cmdTokenCollect(tk, cmd->args, cmd->num_args);
+}
+
+/* Check if object is one of command's tokens. */
+static int cmdTokenCheck(struct cmdToken *tk, robj *o) {
+    if (o->type != OBJ_STRING || !sdsEncodedObject(o))
+        return 0;
+
+    for (int i = 0; i < tk->n_token; i++) {
+        if (strcasecmp(tk->tokens[i], o->ptr) == 0)
+            return 1;
+    }
+    return 0;
+}
 
 __attribute__ ((noinline))
 void _serverAssert(const char *estr, const char *file, int line) {
@@ -1052,15 +1498,31 @@ void _serverAssert(const char *estr, const char *file, int line) {
 void _serverAssertPrintClientInfo(const client *c) {
     int j;
     char conninfo[CONN_INFO_LEN];
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     bugReportStart();
     serverLog(LL_WARNING,"=== ASSERTION FAILED CLIENT CONTEXT ===");
     serverLog(LL_WARNING,"client->flags = %llu", (unsigned long long) c->flags);
     serverLog(LL_WARNING,"client->conn = %s", connGetInfo(c->conn, conninfo, sizeof(conninfo)));
     serverLog(LL_WARNING,"client->argc = %d", c->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(c->argv, c->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j=0; j < c->argc; j++) {
         char buf[128];
         char *arg;
+
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, c->argv[j])) {
+                serverLog(LL_WARNING, "client->argv[%d] = *redacted*", j);
+                continue;
+            }
+        }
 
         if (c->argv[j]->type == OBJ_STRING && sdsEncodedObject(c->argv[j])) {
             arg = (char*) c->argv[j]->ptr;
@@ -1088,23 +1550,34 @@ void serverLogObjectDebugInfo(const robj *o) {
      * random memory portion to be "leaked" into the logfile. */
     if (o->type == OBJ_STRING && sdsEncodedObject(o)) {
         serverLog(LL_WARNING,"Object raw string len: %zu", sdslen(o->ptr));
-        if (sdslen(o->ptr) < 4096) {
+        if (!server.hide_user_data_from_log && sdslen(o->ptr) < 4096) {
             sds repr = sdscatrepr(sdsempty(),o->ptr,sdslen(o->ptr));
             serverLog(LL_WARNING,"Object raw string content: %s", repr);
             sdsfree(repr);
         }
+    } else if (o->type == OBJ_BITMAP) {
+        serverLog(LL_WARNING,"Bitmap logical byte length: %llu",
+                  (unsigned long long)bitroarLen(o));
+        serverLog(LL_WARNING,"Bitmap allocation size: %zu",
+                  bitroarAllocSize(o));
     } else if (o->type == OBJ_LIST) {
         serverLog(LL_WARNING,"List length: %d", (int) listTypeLength(o));
     } else if (o->type == OBJ_SET) {
         serverLog(LL_WARNING,"Set size: %d", (int) setTypeSize(o));
     } else if (o->type == OBJ_HASH) {
-        serverLog(LL_WARNING,"Hash size: %d", (int) hashTypeLength(o));
+        serverLog(LL_WARNING,"Hash size: %d", (int) hashTypeLength(o, 0));
     } else if (o->type == OBJ_ZSET) {
         serverLog(LL_WARNING,"Sorted set size: %d", (int) zsetLength(o));
         if (o->encoding == OBJ_ENCODING_SKIPLIST)
             serverLog(LL_WARNING,"Skiplist level: %d", (int) ((const zset*)o->ptr)->zsl->level);
     } else if (o->type == OBJ_STREAM) {
         serverLog(LL_WARNING,"Stream size: %d", (int) streamLength(o));
+#ifdef ENABLE_GCRA
+    } else if (o->type == OBJ_GCRA) {
+#if UINTPTR_MAX == 0xffffffffffffffff
+        serverLog(LL_WARNING, "GCRA object: %lld", (long long)o->ptr);
+#endif
+#endif
     }
 #endif
 }
@@ -1150,11 +1623,17 @@ void _serverPanic(const char *file, int line, const char *msg, ...) {
 
 /* Start a bug report, returning 1 if this is the first time this function was called, 0 otherwise. */
 int bugReportStart(void) {
+    /* Signals, asserts and panics all start here. Arms on the first report,
+     * and again for a nested report while the deadline is paused (memtest).
+     * A running deadline is never extended. A second thread waiting on
+     * signal_handler_lock is covered by the first thread's deadline. */
+    crashWatchdogArmIfIdle();
+
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
+        bug_report_start = 1;
         serverLogRaw(LL_WARNING|LL_RAW,
         "\n\n=== REDIS BUG REPORT START: Cut & paste starting from here ===\n");
-        bug_report_start = 1;
         pthread_mutex_unlock(&bug_report_start_mutex);
         return 1;
     }
@@ -1216,6 +1695,8 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
     GET_SET_RETURN(uc->uc_mcontext.arm_pc, eip);
     #elif defined(__aarch64__) /* Linux AArch64 */
     GET_SET_RETURN(uc->uc_mcontext.pc, eip);
+    #elif defined(__loongarch_lp64) /* Linux LoongArch64 */
+    GET_SET_RETURN(uc->uc_mcontext.__pc, eip);
     #else
     NOT_SUPPORTED();
     #endif
@@ -1255,8 +1736,13 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
 #undef NOT_SUPPORTED
 }
 
+REDIS_NO_SANITIZE_MSAN("memory")
 REDIS_NO_SANITIZE("address")
 void logStackContent(void **sp) {
+    if (server.hide_user_data_from_log) {
+        serverLog(LL_NOTICE,"hide-user-data-from-log is on, skip logging stack content to avoid spilling PII.");
+        return;
+    }
     int i;
     for (i = 15; i >= 0; i--) {
         unsigned long addr = (unsigned long) sp+i;
@@ -1544,6 +2030,50 @@ void logRegisters(ucontext_t *uc) {
 	      (unsigned long) uc->uc_mcontext.fault_address
 		      );
 	      logStackContent((void**)uc->uc_mcontext.arm_sp);
+    #elif defined(__loongarch_lp64) /* Linux LoongArch64 */
+    serverLog(LL_WARNING,
+        "\n"
+        "ra:%016llx tp:%016llx\nsp:%016llx a0:%016llx\n"
+        "a1:%016llx a2:%016llx\na3:%016llx a4:%016llx\n"
+        "a5:%016llx a6:%016llx\na7:%016llx t0:%016llx\n"
+        "t1:%016llx t2:%016llx\nt3:%016llx t4:%016llx\n"
+        "t5:%016llx t6:%016llx\nt7:%016llx t8:%016llx\n"
+        "fp:%016llx s0:%016llx\ns1:%016llx s2:%016llx\n"
+        "s3:%016llx s4:%016llx\ns5:%016llx s6:%016llx\n"
+        "s7:%016llx s8:%016llx\npc:%016llx\n",
+        (unsigned long long) uc->uc_mcontext.__gregs[1],
+        (unsigned long long) uc->uc_mcontext.__gregs[2],
+        (unsigned long long) uc->uc_mcontext.__gregs[3],
+        (unsigned long long) uc->uc_mcontext.__gregs[4],
+        (unsigned long long) uc->uc_mcontext.__gregs[5],
+        (unsigned long long) uc->uc_mcontext.__gregs[6],
+        (unsigned long long) uc->uc_mcontext.__gregs[7],
+        (unsigned long long) uc->uc_mcontext.__gregs[8],
+        (unsigned long long) uc->uc_mcontext.__gregs[9],
+        (unsigned long long) uc->uc_mcontext.__gregs[10],
+        (unsigned long long) uc->uc_mcontext.__gregs[11],
+        (unsigned long long) uc->uc_mcontext.__gregs[12],
+        (unsigned long long) uc->uc_mcontext.__gregs[13],
+        (unsigned long long) uc->uc_mcontext.__gregs[14],
+        (unsigned long long) uc->uc_mcontext.__gregs[15],
+        (unsigned long long) uc->uc_mcontext.__gregs[16],
+        (unsigned long long) uc->uc_mcontext.__gregs[17],
+        (unsigned long long) uc->uc_mcontext.__gregs[18],
+        (unsigned long long) uc->uc_mcontext.__gregs[19],
+        (unsigned long long) uc->uc_mcontext.__gregs[20],
+        (unsigned long long) uc->uc_mcontext.__gregs[22],
+        (unsigned long long) uc->uc_mcontext.__gregs[23],
+        (unsigned long long) uc->uc_mcontext.__gregs[24],
+        (unsigned long long) uc->uc_mcontext.__gregs[25],
+        (unsigned long long) uc->uc_mcontext.__gregs[26],
+        (unsigned long long) uc->uc_mcontext.__gregs[27],
+        (unsigned long long) uc->uc_mcontext.__gregs[28],
+        (unsigned long long) uc->uc_mcontext.__gregs[29],
+        (unsigned long long) uc->uc_mcontext.__gregs[30],
+        (unsigned long long) uc->uc_mcontext.__gregs[31],
+        (unsigned long long) uc->uc_mcontext.__pc
+    );
+    logStackContent((void**)uc->uc_mcontext.__gregs[3]);
     #else
 	NOT_SUPPORTED();
     #endif
@@ -2025,16 +2555,31 @@ void logCurrentClient(client *cc, const char *title) {
 
     sds client;
     int j;
+    struct redisCommand *cmd = NULL;
+    struct cmdToken tokens = {{0}};
 
     serverLog(LL_WARNING|LL_RAW, "\n------ %s CLIENT INFO ------\n", title);
     client = catClientInfoString(sdsempty(),cc);
     serverLog(LL_WARNING|LL_RAW,"%s\n", client);
     sdsfree(client);
     serverLog(LL_WARNING|LL_RAW,"argc: '%d'\n", cc->argc);
+    if (server.hide_user_data_from_log) {
+        cmd = lookupCommand(cc->argv, cc->argc);
+        if (cmd)
+            cmdTokenGetFromCommand(&tokens, cmd);
+    }
+
     for (j = 0; j < cc->argc; j++) {
+        /* Allow command name, subcommand name and command tokens in the log. */
+        if (server.hide_user_data_from_log && (j != 0 && !(j == 1 && cmd && cmd->parent))) {
+            if (!cmdTokenCheck(&tokens, cc->argv[j])) {
+                serverLog(LL_WARNING|LL_RAW, "argv[%d]: '*redacted*'\n", j);
+                continue;
+            }
+        }
         robj *decoded;
         decoded = getDecodedObject(cc->argv[j]);
-        sds repr = sdscatrepr(sdsempty(),decoded->ptr, min(sdslen(decoded->ptr), 128));
+        sds repr = sdscatrepr(sdsempty(),decoded->ptr, min(sdslen(decoded->ptr), 1024));
         serverLog(LL_WARNING|LL_RAW,"argv[%d]: '%s'\n", j, (char*)repr);
         if (!strcasecmp(decoded->ptr, "auth") || !strcasecmp(decoded->ptr, "auth2")) {
             sdsfree(repr);
@@ -2047,15 +2592,11 @@ void logCurrentClient(client *cc, const char *title) {
     /* Check if the first argument, usually a key, is found inside the
      * selected DB, and if so print info about the associated object. */
     if (cc->argc > 1) {
-        robj *val, *key;
-        dictEntry *de;
-
-        key = getDecodedObject(cc->argv[1]);
-        de = dbFind(cc->db, key->ptr, DB_MAIN);
-        if (de) {
-            val = dictGetVal(de);
-            serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", (char*)key->ptr);
-            serverLogObjectDebugInfo(val);
+        robj *key = getDecodedObject(cc->argv[1]);
+        kvobj *kv = dbFind(cc->db, key->ptr);
+        if (kv) {
+            serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", redactLogCstr((char*)key->ptr));
+            serverLogObjectDebugInfo(kv);
         }
         decrRefCount(key);
     }
@@ -2076,7 +2617,7 @@ int memtest_test_linux_anonymous_maps(void) {
     int regions = 0, j;
 
     int fd = openDirectLogFiledes();
-    if (!fd) return 0;
+    if (fd == -1) return 0;
 
     fp = fopen("/proc/self/maps","r");
     if (!fp) {
@@ -2114,12 +2655,19 @@ int memtest_test_linux_anonymous_maps(void) {
         regions++;
     }
 
+    /* This loop's time grows with memory size, but it takes no locks (the
+     * memtest functions print only in --test-memory mode), so it can be slow
+     * without being stuck. Pause the crash watchdog for it only, so the
+     * timeout doesn't depend on instance size. killThreads() and the fopen()
+     * above, and dumpCodeAroundEIP() later, can block and stay covered. */
+    crashWatchdogSet(0);
     int errors = 0;
     for (j = 0; j < regions; j++) {
         if (write(fd,".",1) == -1) { /* Nothing to do. */ }
         errors += memtest_preserving_test((void*)start_vect[j],size_vect[j],1);
         if (write(fd, errors ? "E" : "O",1) == -1) { /* Nothing to do. */ }
     }
+    crashWatchdogSet(crash_watchdog_timeout);
     if (write(fd,"\n",1) == -1) { /* Nothing to do. */ }
 
     /* NOTE: It is very important to close the file descriptor only now
@@ -2303,6 +2851,8 @@ void setupDebugSigHandlers(void) {
 
     setupSigSegvHandler();
 
+    crashWatchdogInit();
+
     struct sigaction act;
 
     sigemptyset(&act.sa_mask);
@@ -2319,6 +2869,12 @@ void setupSigSegvHandler(void) {
         pthread_mutexattr_init(&signal_handler_lock_attr);
         pthread_mutexattr_settype(&signal_handler_lock_attr, PTHREAD_MUTEX_ERRORCHECK);
         pthread_mutex_init(&signal_handler_lock, &signal_handler_lock_attr);
+
+        pthread_mutexattr_init(&bug_report_start_attr);
+        /* Use recursive to avoid deadlock when a signal is raised during bugReportStart(). */
+        pthread_mutexattr_settype(&bug_report_start_attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&bug_report_start_mutex, &bug_report_start_attr);
+
         signal_handler_lock_initialized = 1;
     }
 
@@ -2353,6 +2909,8 @@ void removeSigSegvHandlers(void) {
 }
 
 void printCrashReport(void) {
+    atomicSet(server.crashing, 1);
+
     /* Log INFO and CLIENT LIST */
     logServerInfo();
 
@@ -2433,6 +2991,9 @@ void serverLogHexDump(int level, char *descr, void *value, size_t len) {
 #include <sys/time.h>
 
 void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
+    /* Save and restore errno to avoid spoiling it's value as caught by
+     * WARNING: ThreadSanitizer: signal handler spoils errno */
+    int save_errno = errno;
 #ifdef HAVE_BACKTRACE
     ucontext_t *uc = (ucontext_t*) secret;
 #else
@@ -2453,6 +3014,7 @@ void sigalrmSignalHandler(int sig, siginfo_t *info, void *secret) {
     serverLogRawFromHandler(LL_WARNING,"Sorry: no support for backtrace().");
 #endif
     serverLogRawFromHandler(LL_WARNING,"--------\n");
+    errno = save_errno;
 }
 
 /* Schedule a SIGALRM delivery after the specified period in milliseconds.
@@ -2483,6 +3045,12 @@ void applyWatchdogPeriod(void) {
     }
 }
 
+void debugPauseProcess(void) {
+    serverLog(LL_NOTICE, "Process is about to stop.");
+    raise(SIGSTOP);
+    serverLog(LL_NOTICE, "Process has been continued.");
+}
+
 /* Positive input is sleep time in microseconds. Negative input is fractions
  * of microseconds, i.e. -10 means 100 nanoseconds. */
 void debugDelay(int usec) {
@@ -2503,7 +3071,7 @@ void debugDelay(int usec) {
  * If thread tid blocks or ignores sig_num returns 0 (thread is not ready to catch the signal).
  * also returns 0 if something is wrong and prints a warning message to the log file **/
 static int is_thread_ready_to_signal(const char *proc_pid_task_path, const char *tid, int sig_num) {
-    /* Open the threads status file path /proc/<pid>>/task/<tid>/status */
+    /* Open the threads status file path /proc/<pid>/task/<tid>/status */
     char path_buff[PATH_MAX];
     snprintf_async_signal_safe(path_buff, PATH_MAX, "%s/%s/status", proc_pid_task_path, tid);
 
@@ -2573,13 +3141,18 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
     snprintf_async_signal_safe(path_buff, PATH_MAX, "/proc/%d/task", getpid());
 
     int dir;
-    if (-1 == (dir = open(path_buff,  O_RDONLY | O_DIRECTORY))) return 0;
+    if (-1 == (dir = open(path_buff,  O_RDONLY | O_DIRECTORY))) {
+        serverLogFromHandler(LL_WARNING,
+            "get_ready_to_signal_threads_tids(): Failed to open %s, errno=%d", path_buff, errno);
+        return 0;
+    }
 
     size_t tids_count = 0;
+    size_t threads_seen = 0;
     pid_t calling_tid = syscall(SYS_gettid);
     int current_thread_index = -1;
     long nread;
-    char buff[PATH_MAX];
+    char buff[PATH_MAX] = {0};
 
     /* readdir() is not async-signal-safe (AS-safe).
     Hence, we read the file using SYS_getdents64, which is considered AS-sync*/
@@ -2600,6 +3173,7 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
            long tid;
            string2l(entry->d_name, strlen(entry->d_name), &tid);
 
+            ++threads_seen;
             if(!is_thread_ready_to_signal(path_buff, entry->d_name, sig_num)) continue;
 
             if(tid == calling_tid) {
@@ -2628,6 +3202,13 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
     }
 
     close(dir);
+
+    /* 0 ready threads is either a failed scan or every thread blocking the signal. */
+    if (tids_count == 0) {
+        serverLogFromHandler(LL_WARNING,
+            "get_ready_to_signal_threads_tids(): %lu threads found, none can receive signal %d",
+            (unsigned long)threads_seen, sig_num);
+    }
 
     return tids_count;
 }

@@ -574,7 +574,7 @@ start_server {tags {"expire"}} {
             }
         }
 
-        test {expired key which is created in writeable replicas should be deleted by active expiry} {
+        test {expired key which is created in writable replicas should be deleted by active expiry} {
             $primary flushall
             $replica config set replica-read-only no
             foreach {yes_or_no} {yes no} {
@@ -597,6 +597,21 @@ start_server {tags {"expire"}} {
         r set foo bar
         r ttl foo
     } {-1}
+
+    test {SET command will remove expire with large string (optimization path)} {
+        # This test specifically targets the dbSetValue optimization path
+        # that was missing TTL handling for large strings
+        set large_value [string repeat "A" 1000]
+        r set foo $large_value EX 100
+        r set foo $large_value KEEPTTL
+        set ttl1 [r ttl foo]
+        assert {$ttl1 <= 100 && $ttl1 > 90}
+
+        # Plain SET should remove TTL even with large strings
+        r set foo $large_value
+        set ttl2 [r ttl foo]
+        assert_equal $ttl2 -1
+    }
 
     test {SET - use KEEPTTL option, TTL should not be removed} {
         r set foo bar EX 100
@@ -832,9 +847,51 @@ start_server {tags {"expire"}} {
         close_replication_stream $repl
         assert_equal [r debug set-active-expire 1] {OK}
     } {} {needs:debug}
+
+    test {Lazy expire should increment expired_keys but not expired_keys_active} {
+        r flushall
+        r config resetstat
+        r debug set-active-expire 0
+
+        # Set keys that will expire
+        r set foo1{t} bar PX 1
+        r set foo2{t} bar PX 1
+        r set foo3{t} bar PX 1
+        after 2
+
+        # Trigger lazy expire by accessing the keys
+        assert_equal {{} {} {}} [r mget foo1{t} foo2{t} foo3{t}]
+
+        # Verify that expired_keys was incremented but expired_keys_active was not
+        assert_equal [s expired_keys] 3
+        assert_equal [s expired_keys_active] 0
+
+        assert_equal [r debug set-active-expire 1] {OK}
+    } {} {needs:debug}
+
+    test {Active expire should increment both expired_keys and expired_keys_active} {
+        r flushall
+        r config resetstat
+
+        # Set keys that will expire soon
+        r set foo1 bar PX 1
+        r set foo2 bar PX 1
+        r set foo3 bar PX 1
+
+        # Wait for active expire to kick in
+        wait_for_condition 50 100 {
+            [s expired_keys] == 3
+        } else {
+            fail "Keys were not expired"
+        }
+
+        # Verify that both expired_keys and expired_keys_active were incremented
+        assert_equal [s expired_keys] 3
+        assert_equal [s expired_keys_active] 3
+    } {}
 }
 
-start_cluster 1 0 {tags {"expire external:skip cluster slow"}} {
+start_cluster 1 0 {tags {"expire external:skip cluster"}} {
     test "expire scan should skip dictionaries with lot's of empty buckets" {
         r debug set-active-expire 0
 
@@ -853,9 +910,9 @@ start_cluster 1 0 {tags {"expire external:skip cluster slow"}} {
         # hashslot(key) is 12539
         r psetex key 500 val
 
-        # disable resizing
-        r config set rdb-key-save-delay 10000000
-        r bgsave
+        # disable resizing, the reason for not using slow bgsave is because
+        # it will hit the dict_force_resize_ratio.
+        r debug dict-resizing 0
 
         # delete data to have lot's (99%) of empty buckets (slot 12182 should be skipped)
         for {set j 1} {$j <= 99} {incr j} {
@@ -872,20 +929,16 @@ start_cluster 1 0 {tags {"expire external:skip cluster slow"}} {
             [r dbsize] eq 1
         } else {
             if {[r dbsize] eq 0} {
+                puts [r debug htstats 0]
                 fail "scan didn't handle slot skipping logic."
             } else {
+                puts [r debug htstats 0]
                 fail "scan didn't process all valid slots."
             }
         }
 
         # Enable resizing
-        r config set rdb-key-save-delay 0
-        catch {exec kill -9 [get_child_pid 0]}
-        wait_for_condition 1000 10 {
-            [s rdb_bgsave_in_progress] eq 0
-        } else {
-            fail "bgsave did not stop in time."
-        }
+        r debug dict-resizing 1
 
         # put some data into slot 12182 and trigger the resize
         r psetex "{foo}0" 500 a
@@ -898,5 +951,64 @@ start_cluster 1 0 {tags {"expire external:skip cluster slow"}} {
             flush stdout
             fail "Keys did not actively expire."
         }
+
+        # Make sure we don't have any timeouts.
+        assert_equal 0 [s 0 expired_time_cap_reached_count]
     } {} {needs:debug}
 }
+
+# Config lazyexpire-nested-arbitrary-keys test body
+proc conf_le_test {option mode} {
+    r config set lazyexpire-nested-arbitrary-keys $option
+    r debug set-active-expire 0
+    r flushall
+    r script LOAD {return redis.call('SCAN', 0)}
+
+    r set foo bar
+    r pexpire foo 1
+    after 2
+
+    set repl [attach_to_replication_stream]
+
+    # First two conditions hit lazy expire within a 'transaction', meaning
+    # DEL propagation should be blocked if 'lazyexpire-nested-arbitrary-keys' is set.
+    if {$mode == "lua"} {
+        r eval "return redis.call('SCAN', 0)" 0
+    } elseif {$mode == "multi"} {
+        r multi
+        r scan 0
+        r exec
+    } else {
+        r scan 0
+    }
+
+    # dummy command to verify nothing else gets into the replication stream.
+    r set x 1
+
+    if {$option == "no" && $mode != "direct"} {
+        assert_replication_stream $repl {
+            {select *}
+            {set x 1}
+        }
+    } else {
+        assert_replication_stream $repl {
+            {select *}
+            {del foo}
+            {set x 1}
+        }
+    }
+
+    close_replication_stream $repl
+    r script flush
+    assert_equal [r config set lazyexpire-nested-arbitrary-keys yes] {OK}
+    assert_equal [r debug set-active-expire 1] {OK}
+}
+
+foreach option {yes no} {
+foreach mode {direct multi lua} {
+    start_server {tags {"expire"}} {
+        test "Config lazyexpire-nested-arbitrary-keys ($option, $mode)" {
+            conf_le_test $option $mode
+        } {} {needs:debug repl}
+    }
+}}

@@ -137,6 +137,61 @@ start_server {tags {"hll"}} {
         set e
     } {*WRONGTYPE*}
 
+    test {Corrupted sparse HyperLogLogs doesn't cause overflow and out-of-bounds with XZERO opcode} {
+        r del hll
+        
+        # Create a sparse-encoded HyperLogLog header
+        set header "HYLL"
+        set payload [binary format c12 {1 0 0 0 0 0 0 0 0 0 0 0}]
+        set pl [binary format a4a12 $header $payload]
+
+        # Create an XZERO opcode with the maximum run length of 16384(2^14)
+        set runlen [expr 16384 - 1]
+        set chunk [binary format cc [expr {0b01000000 | ($runlen >> 8)}] [expr {$runlen & 0xff}]]
+        # Fill the HLL with more than 131072(2^17) XZERO opcodes to make the total
+        # run length exceed 4GB, will cause an integer overflow.
+        set repeat [expr 131072 + 1000]
+        for {set i 0} {$i < $repeat} {incr i} {
+            append pl $chunk
+        }
+
+        # Create a VAL opcode with a value that will cause out-of-bounds.
+        append pl [binary format c 0b11111111]
+        r set hll $pl
+
+        # This should not overflow and out-of-bounds.
+        assert_error {*INVALIDOBJ*} {r pfcount hll hll}
+        assert_error {*INVALIDOBJ*} {r pfdebug getreg hll}
+        r ping
+    }
+
+    test {Corrupted sparse HyperLogLogs doesn't cause overflow and out-of-bounds with ZERO opcode} {
+        r del hll
+        
+        # Create a sparse-encoded HyperLogLog header
+        set header "HYLL"
+        set payload [binary format c12 {1 0 0 0 0 0 0 0 0 0 0 0}]
+        set pl [binary format a4a12 $header $payload]
+
+        # # Create an ZERO opcode with the maximum run length of 64(2^6)
+        set chunk [binary format c [expr {0b00000000 | 0x3f}]]
+        # Fill the HLL with more than 33554432(2^17) ZERO opcodes to make the total
+        # run length exceed 4GB, will cause an integer overflow.
+        set repeat [expr 33554432 + 1000]
+        for {set i 0} {$i < $repeat} {incr i} {
+            append pl $chunk
+        }
+
+        # Create a VAL opcode with a value that will cause out-of-bounds.
+        append pl [binary format c 0b11111111]
+        r set hll $pl
+
+        # This should not overflow and out-of-bounds.
+        assert_error {*INVALIDOBJ*} {r pfcount hll hll}
+        assert_error {*INVALIDOBJ*} {r pfdebug getreg hll}
+        r ping
+    }
+
     test {Corrupted dense HyperLogLogs are detected: Wrong length} {
         r del hll
         r pfadd hll a b c
@@ -222,6 +277,46 @@ start_server {tags {"hll"}} {
         assert_equal 3 [r pfcount destkey]
     }
 
+    test {PFMERGE results with simd} {
+        r del hllscalar{t} hllsimd{t} hll1{t} hll2{t} hll3{t}
+        for {set x 1} {$x < 2000} {incr x} {
+            r pfadd hll1{t} [expr rand()]
+        }
+        for {set x 1} {$x < 4000} {incr x} {
+            r pfadd hll2{t} [expr rand()]
+        }
+        for {set x 1} {$x < 8000} {incr x} {
+            r pfadd hll3{t} [expr rand()]
+        }
+        assert {[r pfcount hll1{t}] > 0}
+        assert {[r pfcount hll2{t}] > 0}
+        assert {[r pfcount hll3{t}] > 0}
+
+        r pfdebug simd off
+        set scalar [r pfcount hll1{t} hll2{t} hll3{t}]
+        r pfdebug simd on
+        set simd [r pfcount hll1{t} hll2{t} hll3{t}]
+        assert {$scalar > 0}
+        assert {$simd > 0}
+        assert_equal $scalar $simd
+
+        r pfdebug simd off
+        r pfmerge hllscalar{t} hll1{t} hll2{t} hll3{t}
+        r pfdebug simd on
+        r pfmerge hllsimd{t} hll1{t} hll2{t} hll3{t}
+
+        set scalar [r pfcount hllscalar{t}]
+        set simd [r pfcount hllsimd{t}]
+        assert {$scalar > 0}
+        assert {$simd > 0}
+        assert_equal $scalar $simd
+
+        set scalar [r get hllscalar{t}]
+        set simd [r get hllsimd{t}]
+        assert_equal $scalar $simd
+
+    } {} {needs:pfdebug}
+
     test {PFCOUNT multiple-keys merge returns cardinality of union #1} {
         r del hll1{t} hll2{t} hll3{t}
         for {set x 1} {$x < 10000} {incr x} {
@@ -268,4 +363,12 @@ start_server {tags {"hll"}} {
         r pfadd hll 1 2 3
         assert {[r getrange hll 15 15] eq "\x80"}
     }
+
+    test {PFADD with 2GB entry should not crash server due to overflow in MurmurHash64A} {
+        r config set proto-max-bulk-len 3221225472
+        r config set client-query-buffer-limit 3221225472
+        r write "*3\r\n\$5\r\nPFADD\r\n\$3\r\nhll\r\n"
+        write_big_bulk 2147483648;
+        r ping
+    } {PONG} {large-memory}
 }

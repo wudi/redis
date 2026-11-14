@@ -1,6 +1,6 @@
 set testmodule [file normalize tests/modules/scan.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {Module scan keyspace} {
@@ -24,6 +24,18 @@ start_server {tags {"modules"}} {
         lsort [r scan.scan_key hh1]
     } {{f1 1}}
 
+    test {Module scan hash listpack with hexpire} {
+        r debug set-active-expire 0
+        r hmset hh f1 v1 f2 v2 f3 v3
+        r hexpire hh 100000 fields 1 f1
+        r hpexpire hh 1 fields 1 f3
+        after 10
+        assert_range [r httl hh fields 1 f1] 10000 100000
+        assert_encoding listpackex hh
+        r debug set-active-expire 1
+        lsort [r scan.scan_key hh]
+    } {{f1 v1} {f2 v2}} {needs:debug}
+
     test {Module scan hash dict} {
         r config set hash-max-ziplist-entries 2
         r hmset hh f3 v3
@@ -31,18 +43,79 @@ start_server {tags {"modules"}} {
         lsort [r scan.scan_key hh]
     } {{f1 v1} {f2 v2} {f3 v3}}
 
+    test {Module scan hash dict with hexpire} {
+        r config set hash-max-listpack-entries 1
+        r del hh
+        r hmset hh f1 v1 f2 v2 f3 v3
+        r hexpire hh 100000 fields 1 f2
+        r hpexpire hh 5 fields 1 f3
+        assert_range [r httl hh fields 1 f2] 10000 100000
+        assert_encoding hashtable hh
+        after 10
+        lsort [r scan.scan_key hh]
+    } {{f1 v1} {f2 v2}}
+
+    test {Module scan hash with hexpire can return no items} {
+        r del hh
+        r debug set-active-expire 0
+        r hmset hh f1 v1 f2 v2 f3 v3
+        r hpexpire hh 1 fields 3 f1 f2 f3
+        after 10
+        assert_equal [r scan.scan_key hh] {}
+        r debug set-active-expire 1
+    } {OK} {needs:debug}
+
+    test {Module scan hash template-listpack} {
+        r config set hash-min-template-entries 0
+        r config set hash-max-listpack-entries 128
+        r del th
+        r himport prepare fieldset fa fb fc
+        r himport set th fieldset hello 123 world
+        assert_encoding template-listpack th
+        lsort [r scan.scan_key th]
+    } {{fa hello} {fb 123} {fc world}}
+
+    test {Module scan hash template-array} {
+        r config set hash-min-template-entries 0
+        r config set hash-max-listpack-entries 0
+        r del ta
+        r himport prepare fieldset fa fb fc
+        r himport set ta fieldset hello 123 world
+        assert_encoding template-array ta
+        set res [lsort [r scan.scan_key ta]]
+        # cleanup
+        r config set hash-max-listpack-entries 512
+        r config set hash-min-template-entries 0
+        set res
+    } {{fa hello} {fb 123} {fc world}}
+
     test {Module scan zset listpack} {
         r zadd zz 1 f1 2 f2
         assert_encoding listpack zz
         lsort [r scan.scan_key zz]
     } {{f1 1} {f2 2}}
 
-    test {Module scan zset skiplist} {
+    test {Module scan zset btree} {
         r config set zset-max-ziplist-entries 2
         r zadd zz 3 f3
-        assert_encoding skiplist zz
+        assert_encoding btree zz
         lsort [r scan.scan_key zz]
     } {{f1 1} {f2 2} {f3 3}}
+
+    test {Module scan zset btree tolerates deleting a returned member} {
+        r del zz
+        for {set i 0} {$i < 100} {incr i} {
+            r zadd zz $i [format "member:%03d" $i]
+        }
+        assert_encoding btree zz
+
+        set visited [lsort -unique [r scan.scan_key_delete zz]]
+        set remaining [r zrange zz 0 -1]
+        assert_equal 99 [llength $remaining]
+        foreach member $remaining {
+            assert {$member in $visited}
+        }
+    }
 
     test {Module scan set intset} {
         r sadd ss 1 2

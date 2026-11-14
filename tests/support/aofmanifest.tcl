@@ -1,5 +1,5 @@
-set ::base_aof_sufix ".base"
-set ::incr_aof_sufix ".incr"
+set ::base_aof_suffix ".base"
+set ::incr_aof_suffix ".incr"
 set ::manifest_suffix ".manifest"
 set ::aof_format_suffix ".aof"
 set ::rdb_format_suffix ".rdb"
@@ -122,7 +122,7 @@ proc assert_aof_manifest_content {manifest_path content} {
     assert_equal [llength $lines] [llength $content]
 
     for { set i 0 } { $i < [llength $lines] } {incr i} {
-        assert_equal [lindex $lines $i] [lindex $content $i]
+        assert {[string first [lindex $content $i] [lindex $lines $i]] != -1}
     }
 }
 

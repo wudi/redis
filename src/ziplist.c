@@ -151,8 +151,7 @@
  * ----------------------------------------------------------------------------
  *
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
- * Copyright (c) 2009-2017, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2020, Redis Labs, Inc
+ * Copyright (c) 2009-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -750,7 +749,7 @@ unsigned char *ziplistResize(unsigned char *zl, size_t len) {
  * updated, i.e. consecutive fields MAY need an update. */
 unsigned char *__ziplistCascadeUpdate(unsigned char *zl, unsigned char *p) {
     zlentry cur;
-    size_t prevlen, prevlensize, prevoffset; /* Informat of the last changed entry. */
+    size_t prevlen, prevlensize, prevoffset; /* Info of the last changed entry. */
     size_t firstentrylen; /* Used to handle insert at head. */
     size_t rawlen, curlen = intrev32ifbe(ZIPLIST_BYTES(zl));
     size_t extra = 0, cnt = 0, offset;
@@ -1584,7 +1583,7 @@ int uintCompare(const void *a, const void *b) {
     return (*(unsigned int *) a - *(unsigned int *) b);
 }
 
-/* Helper method to store a string into from val or lval into dest */
+/* Helper method to store a string from val or lval into dest */
 static inline void ziplistSaveValue(unsigned char *val, unsigned int len, long long lval, ziplistEntry *dest) {
     dest->sval = val;
     dest->slen = len;
@@ -2368,7 +2367,7 @@ int ziplistTest(int argc, char **argv, int flags) {
         for (i = 0; i < iteration; i++) {
             zl = ziplistNew();
             ref = listCreate();
-            listSetFreeMethod(ref,(void (*)(void*))sdsfree);
+            listSetFreeMethod(ref, sdsfreegeneric);
             len = rand() % 256;
 
             /* Create lists */

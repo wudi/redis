@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2009-2012, Pieter Noordhuis <pcnoordhuis at gmail dot com>
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -100,6 +100,12 @@ intset *intsetNew(void) {
     is->encoding = intrev32ifbe(INTSET_ENC_INT16);
     is->length = 0;
     return is;
+}
+
+size_t intsetAllocSize(intset *is) {
+    uint64_t size = (uint64_t)intrev32ifbe(is->length)*intrev32ifbe(is->encoding);
+    assert(size <= SIZE_MAX - sizeof(intset));
+    return sizeof(intset)+size;
 }
 
 /* Resize the intset */

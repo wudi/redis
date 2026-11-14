@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2014, Matt Stancliff <matt@genges.com>.
- * Copyright (c) 2015-2016, Salvatore Sanfilippo <antirez@gmail.com>.
+ * Copyright (c) 2015-current, Redis Ltd.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,6 +30,7 @@
 
 #include "geo.h"
 #include "geohash_helper.h"
+#include "zset_btree.h"
 #include "debugmacro.h"
 #include "pqsort.h"
 
@@ -108,7 +109,7 @@ int extractLongLatOrReply(client *c, robj **argv, double *xy) {
     if (xy[0] < GEO_LONG_MIN || xy[0] > GEO_LONG_MAX ||
         xy[1] < GEO_LAT_MIN  || xy[1] > GEO_LAT_MAX) {
         addReplyErrorFormat(c,
-            "-ERR invalid longitude,latitude pair %f,%f\r\n",xy[0],xy[1]);
+            "invalid longitude,latitude pair %f,%f",xy[0],xy[1]);
         return C_ERR;
     }
     return C_OK;
@@ -300,7 +301,7 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
         zskiplist *zsl = zs->zsl;
         zskiplistNode *ln;
 
-        if ((ln = zslNthInRange(zsl, &range, 0)) == NULL) {
+        if ((ln = zslNthInRange(zsl, &range, 0, NULL)) == NULL) {
             /* Nothing exists starting at our min.  No results. */
             return 0;
         }
@@ -313,10 +314,26 @@ int geoGetPointsInRange(robj *zobj, double min, double max, GeoShape *shape, geo
                 break;
             if (geoWithinShape(shape, ln->score, xy, &distance) == C_OK) {
                 /* Append the new element. */
-                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ln->ele));
+                sds ele = zslGetNodeElement(ln);
+                geoArrayAppend(ga, xy, distance, ln->score, sdsdup(ele));
             }
             if (ga->used && limit && ga->used >= limit) break;
             ln = ln->level[0].forward;
+        }
+    } else if (zobj->encoding == OBJ_ENCODING_BTREE) {
+        zbtreeIterator iter;
+        const unsigned char *ele;
+        size_t len;
+        double score;
+        if (!zbtreeIteratorSeekScore(zobj->ptr, range.min, range.minex, 0, &iter, NULL))
+            return 0;
+        while (zbtreeIteratorNext(&iter, 0, &ele, &len, &score)) {
+            double xy[2];
+            double distance = 0;
+            if (!zslValueLteMax(score, &range)) break;
+            if (geoWithinShape(shape, score, xy, &distance) == C_OK)
+                geoArrayAppend(ga, xy, distance, score, sdsnewlen(ele, len));
+            if (ga->used && limit && ga->used >= limit) break;
         }
     }
     return ga->used - origincount;
@@ -525,7 +542,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
     int storedist = 0; /* 0 for STORE, 1 for STOREDIST. */
 
     /* Look up the requested zset */
-    robj *zobj = lookupKeyRead(c->db, c->argv[srcKeyIndex]);
+    kvobj *zobj = lookupKeyRead(c->db, c->argv[srcKeyIndex]);
     if (checkType(c, zobj, OBJ_ZSET)) return;
 
     /* Find long/lat to use for radius or box search based on inquiry type */
@@ -699,7 +716,7 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
         if (storekey) {
             /* store key is not NULL, try to delete it and return 0. */
             if (dbDelete(c->db, storekey)) {
-                signalModifiedKey(c, c->db, storekey);
+                keyModified(c, c->db, storekey, NULL, 1);
                 notifyKeyspaceEvent(NOTIFY_GENERIC, "del", storekey, c->db->id);
                 server.dirty++;
             }
@@ -796,45 +813,36 @@ void georadiusGeneric(client *c, int srcKeyIndex, int flags) {
 
             if (withcoords) {
                 addReplyArrayLen(c, 2);
-                addReplyHumanLongDouble(c, gp->longitude);
-                addReplyHumanLongDouble(c, gp->latitude);
+                addReplyDouble(c,gp->longitude);
+                addReplyDouble(c,gp->latitude);
             }
         }
     } else {
         /* Target key, create a sorted set with the results. */
         robj *zobj;
-        zset *zs;
         int i;
-        size_t maxelelen = 0, totelelen = 0;
 
-        if (returned_items) {
-            zobj = createZsetObject();
-            zs = zobj->ptr;
-        }
+        if (returned_items)
+            zobj = zsetTypeCreate(returned_items, 0);
 
         for (i = 0; i < returned_items; i++) {
-            zskiplistNode *znode;
             geoPoint *gp = ga->array+i;
             gp->dist /= shape.conversion; /* Fix according to unit. */
             double score = storedist ? gp->dist : gp->score;
-            size_t elelen = sdslen(gp->member);
-
-            if (maxelelen < elelen) maxelelen = elelen;
-            totelelen += elelen;
-            znode = zslInsert(zs->zsl,score,gp->member);
-            serverAssert(dictAdd(zs->dict,gp->member,&znode->score) == DICT_OK);
+            int out_flags;
+            serverAssert(zsetAdd(zobj, score, gp->member, ZADD_IN_NONE, &out_flags, NULL));
+            serverAssert(out_flags & ZADD_OUT_ADDED);
+            sdsfree(gp->member);
             gp->member = NULL;
         }
 
         if (returned_items) {
-            zsetConvertToListpackIfNeeded(zobj,maxelelen,totelelen);
-            setKey(c,c->db,storekey,zobj,0);
-            decrRefCount(zobj);
+            setKey(c,c->db,storekey,&zobj,0);
             notifyKeyspaceEvent(NOTIFY_ZSET,flags & GEOSEARCH ? "geosearchstore" : "georadiusstore",storekey,
                                 c->db->id);
             server.dirty += returned_items;
         } else if (dbDelete(c->db,storekey)) {
-            signalModifiedKey(c,c->db,storekey);
+            keyModified(c,c->db,storekey,NULL,1);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",storekey,c->db->id);
             server.dirty++;
         }
@@ -880,7 +888,7 @@ void geohashCommand(client *c) {
     int j;
 
     /* Look up the requested zset */
-    robj *zobj = lookupKeyRead(c->db, c->argv[1]);
+    kvobj *zobj = lookupKeyRead(c->db, c->argv[1]);
     if (checkType(c, zobj, OBJ_ZSET)) return;
 
     /* Geohash elements one after the other, using a null bulk reply for
@@ -959,8 +967,8 @@ void geoposCommand(client *c) {
                 continue;
             }
             addReplyArrayLen(c,2);
-            addReplyHumanLongDouble(c,xy[0]);
-            addReplyHumanLongDouble(c,xy[1]);
+            addReplyDouble(c,xy[0]);
+            addReplyDouble(c,xy[1]);
         }
     }
 }
@@ -983,7 +991,7 @@ void geodistCommand(client *c) {
     }
 
     /* Look up the requested zset */
-    robj *zobj = NULL;
+    kvobj *zobj = NULL;
     if ((zobj = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp]))
         == NULL || checkType(c, zobj, OBJ_ZSET)) return;
 

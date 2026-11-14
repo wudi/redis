@@ -1,22 +1,10 @@
 tags {"external:skip"} {
 
 set system_name [string tolower [exec uname -s]]
-set backtrace_supported 0
+set backtrace_supported [system_backtrace_supported]
 set threads_mngr_supported 0 ;# Do we support printing stack trace from all threads, not just the one that got the signal?
-
-# We only support darwin or Linux with glibc
-if {$system_name eq {darwin}} {
-    set backtrace_supported 1
-} elseif {$system_name eq {linux}} {
+if {$system_name eq {linux}} {
     set threads_mngr_supported 1
-    # Avoid the test on libmusl, which does not support backtrace
-    # and on static binaries (ldd exit code 1) where we can't detect libmusl
-    catch {
-        set ldd [exec ldd src/redis-server]
-        if {![string match {*libc.*musl*} $ldd]} {
-            set backtrace_supported 1
-        }
-    }
 }
 
 # look for the DEBUG command in the backtrace, used when we triggered
@@ -104,6 +92,21 @@ if {!$::valgrind} {
         }
     }
 
+    # test that a healthy crash report completes within the crash watchdog
+    # timeout, so the watchdog stays silent (the watchdog is Linux-only)
+    if {$threads_mngr_supported} {
+        set server_path [tmpdir server_watchdog_healthy.log]
+        start_server [list overrides [list dir $server_path crash-memcheck-enabled no]] {
+            test "Crash watchdog does not fire on a healthy crash report" {
+                r debug set-crash-watchdog-timeout 2
+                catch {r debug segfault}
+                $check_cb "*crashed by signal*"
+                assert_equal [count_log_message 0 "CRASH WATCHDOG"] 0
+                assert_equal [count_log_message 0 "REDIS BUG REPORT END"] 1
+            }
+        }
+    }
+
     # test DEBUG SIGALRM being non-fatal
     set server_path [tmpdir server3.log]
     start_server [list overrides [list dir $server_path]] {
@@ -131,6 +134,34 @@ if {$backtrace_supported} {
         test "Generate stacktrace on assertion" {
             catch {r debug assert}
             check_log_backtrace_for_debug "*ASSERTION FAILED*"
+        }
+    }
+}
+
+# Tests that when `hide-user-data-from-log` is enabled, user information from logs is hidden
+if {$backtrace_supported} {
+    if {!$::valgrind} {
+        set server_path [tmpdir server5.log]
+        start_server [list overrides [list dir $server_path crash-memcheck-enabled no]] {
+            test "Crash report generated on DEBUG SEGFAULT with user data hidden when 'hide-user-data-from-log' is enabled" {
+                r config set hide-user-data-from-log yes
+                catch {r debug segfault}
+                check_log_backtrace_for_debug "*crashed by signal*"
+                check_log_backtrace_for_debug "*argv*0*: *debug*"
+                check_log_backtrace_for_debug "*argv*1*: *redacted*"
+                check_log_backtrace_for_debug "*hide-user-data-from-log is on, skip logging stack content to avoid spilling PII*"
+            }
+        }
+    }
+
+    set server_path [tmpdir server6.log]
+    start_server [list overrides [list dir $server_path use-exit-on-panic yes crash-memcheck-enabled no]] {
+        test "Generate stacktrace on assertion with user data hidden when 'hide-user-data-from-log' is enabled" {
+            r config set hide-user-data-from-log yes
+            catch {r debug assert}
+            check_log_backtrace_for_debug "*ASSERTION FAILED*"
+            check_log_backtrace_for_debug "*argv*0* = *debug*"
+            check_log_backtrace_for_debug "*argv*1* = *redacted*"
         }
     }
 }

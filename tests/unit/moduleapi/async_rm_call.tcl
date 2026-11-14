@@ -2,7 +2,7 @@ set testmodule [file normalize tests/modules/blockedclient.so]
 set testmodule2 [file normalize tests/modules/postnotifications.so]
 set testmodule3 [file normalize tests/modules/blockonkeys.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {Locked GIL acquisition from async RM_Call} {
@@ -222,7 +222,7 @@ start_server {tags {"modules"}} {
     }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
 
     test {Test basic replication stream on unblock handler} {
@@ -297,9 +297,66 @@ start_server {tags {"modules"}} {
         wait_for_blocked_clients_count 0
         $rd close
     }
+
+    test {Test no propagation of effect commands queued by a blocking command} {
+        r flushall
+        r xgroup create s g $ MKSTREAM
+        set repl [attach_to_replication_stream]
+
+        set rd [redis_deferring_client]
+
+        $rd do_rm_call_async_no_replicate xreadgroup group g c block 0 streams s >
+        wait_for_blocked_clients_count 1
+        r xadd s * f v
+        assert {[$rd read] ne {}}
+
+        # XREADGROUP propagates the delivery to the consumer group as an XCLAIM
+        # queued via alsoPropagate(). The RM_Call was made without '!', and the
+        # restriction must survive the blocking of the command.
+        r set x 1
+
+        assert_replication_stream $repl {
+            {select *}
+            {xadd s * f v}
+            {set x 1}
+        }
+        close_replication_stream $repl
+
+        wait_for_blocked_clients_count 0
+        $rd close
+    }
+
+    test {Test no propagation of effect commands queued by a nested blocking command} {
+        r flushall
+        r xgroup create s g $ MKSTREAM
+        set repl [attach_to_replication_stream]
+
+        set rd [redis_deferring_client]
+
+        # The outer RM_Call omits '!' while the inner one asks for propagation
+        # and blocks: the restriction of the outer call must still be honored
+        # once the inner command is reprocessed.
+        $rd do_rm_call_async_no_replicate do_rm_call_async \
+            xreadgroup group g c block 0 streams s >
+        wait_for_blocked_clients_count 1
+        r xadd s * f v
+        assert {[$rd read] ne {}}
+
+        r set x 1
+
+        assert_replication_stream $repl {
+            {select *}
+            {xadd s * f v}
+            {set x 1}
+        }
+        close_replication_stream $repl
+
+        wait_for_blocked_clients_count 0
+        $rd close
+    }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
     r module load $testmodule2
 
@@ -416,7 +473,7 @@ start_server {tags {"modules"}} {
     }
 }
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule
     r module load $testmodule3
 

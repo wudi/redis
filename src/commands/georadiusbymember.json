@@ -9,6 +9,10 @@
         "get_keys_function": "georadiusGetKeys",
         "history": [
             [
+                "6.2.0",
+                "Added the `ANY` option for `COUNT`."
+            ],
+            [
                 "7.0.0",
                 "Added support for uppercase unit names."
             ]
@@ -45,9 +49,11 @@
                 }
             },
             {
+                "notes": "Incomplete because duplicate STORE options use last-wins; fall back to georadiusGetKeys",
                 "flags": [
                     "OW",
-                    "UPDATE"
+                    "UPDATE",
+                    "INCOMPLETE"
                 ],
                 "begin_search": {
                     "keyword": {
@@ -64,9 +70,11 @@
                 }
             },
             {
+                "notes": "Incomplete because duplicate STOREDIST options use last-wins; fall back to georadiusGetKeys",
                 "flags": [
                     "OW",
-                    "UPDATE"
+                    "UPDATE",
+                    "INCOMPLETE"
                 ],
                 "begin_search": {
                     "keyword": {

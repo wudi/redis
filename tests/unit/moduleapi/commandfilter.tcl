@@ -1,6 +1,6 @@
 set testmodule [file normalize tests/modules/commandfilter.so]
 
-start_server {tags {"modules"}} {
+start_server {tags {"modules external:skip"}} {
     r module load $testmodule log-key 0
 
     test {Retain a command filter argument} {
@@ -103,7 +103,7 @@ test {RM_CommandFilterArgInsert and script argv caching} {
     # this test needs a fresh server so that lua_argv_size is 0.
     # glibc realloc can return the same pointer even when the size changes
     # still this test isn't able to trigger the issue, but we keep it anyway.
-    start_server {tags {"modules"}} {
+    start_server {tags {"modules external:skip"}} {
         r module load $testmodule log-key 0
         r del mylist
         # command with 6 args
@@ -119,7 +119,7 @@ test {RM_CommandFilterArgInsert and script argv caching} {
 # previously, there was a bug that command filters would be rerun (which would cause args to swap back)
 # this test is meant to protect against that bug
 test {Blocking Commands don't run through command filter when reprocessed} {
-    start_server {tags {"modules"}} {
+    start_server {tags {"modules external:skip"}} {
         r module load $testmodule log-key 0
 
         r del list1{t}
@@ -145,7 +145,7 @@ test {Blocking Commands don't run through command filter when reprocessed} {
 }
 
 test {Filtering based on client id} {
-    start_server {tags {"modules"}} {
+    start_server {tags {"modules external:skip"}} {
         r module load $testmodule log-key 0
 
         set rr [redis_client]
@@ -164,12 +164,44 @@ test {Filtering based on client id} {
     }
 }
 
-start_server {} {
+start_server {tags {"external:skip"}} {
     test {OnLoad failure will handle un-registration} {
         catch {r module load $testmodule log-key 0 noload}
         r set mykey @log
         assert_equal [r lrange log-key 0 -1] {}
         r rpush mylist elem1 @delme elem2
         assert_equal [r lrange mylist 0 -1] {elem1 @delme elem2}
+    }
+}
+
+# A command filter that changes argv invalidates everything the server already
+# derived from the pre-filter argv (looked up command, keys, slot, cross-slot
+# error). These tests make sure the outside world is refreshed accordingly.
+start_cluster 1 0 [list tags {modules cluster external:skip} config_lines [list loadmodule "$testmodule log-key 0"]] {
+    test {Command Filter refreshes cross-slot state when args are deleted} {
+        # "del a{t} @delme" is cross-slot before filtering, and a single-key
+        # command after the filter deleted @delme. It must not be rejected.
+        assert_equal 0 [r del a{t} @delme]
+
+        r set a{t} v1
+        assert_equal 1 [r del a{t} @delme]
+
+        # Same thing for a read command with more than one key left.
+        r mset a{t} v1 b{t} v2
+        assert_equal {v1 v2} [r mget a{t} @delme b{t}]
+    }
+
+    test {Command Filter refreshes cross-slot state when args are inserted} {
+        # Both keys hash to the same slot before filtering, but the filter
+        # appends --inserted-after--, which turns it into a cross-slot command.
+        assert_error "CROSSSLOT*" {r mget a{@insertafter} @insertafter}
+    }
+
+    test {Command Filter refreshes the slot when a key argument is replaced} {
+        # The filter rewrites @replaceme into --replaced--, so the slot cached
+        # for the original key must not leak into the new command.
+        r set --replaced-- v1
+        assert_equal v1 [r get @replaceme]
+        assert_equal 1 [r del @replaceme]
     }
 }

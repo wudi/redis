@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-current, Redis Ltd.
  * Copyright (c) 2012, Twitter, Inc.
  * All rights reserved.
  *
@@ -30,6 +30,7 @@
 
 #include "fmacros.h"
 #include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,13 +51,24 @@
 #include "util.h"
 #include "sha256.h"
 #include "config.h"
+#include "zmalloc.h"
 
 #define UNUSED(x) ((void)(x))
 
+/* Selectively define static_assert. Attempt to avoid include server.h in this file. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
+static_assert(UINTPTR_MAX == 0xffffffffffffffff || UINTPTR_MAX == 0xffffffff, "Unsupported pointer size");
+
 /* Glob-style pattern matching. */
 static int stringmatchlen_impl(const char *pattern, int patternLen,
-        const char *string, int stringLen, int nocase, int *skipLongerMatches)
+        const char *string, int stringLen, int nocase, int *skipLongerMatches, int nesting)
 {
+    /* Protection against abusive patterns. */
+    if (nesting > 1000) return 0;
+
     while(patternLen && stringLen) {
         switch(pattern[0]) {
         case '*':
@@ -68,7 +80,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
                 return 1; /* match */
             while(stringLen) {
                 if (stringmatchlen_impl(pattern+1, patternLen-1,
-                            string, stringLen, nocase, skipLongerMatches))
+                            string, stringLen, nocase, skipLongerMatches, nesting+1))
                     return 1; /* match */
                 if (*skipLongerMatches)
                     return 0; /* no match */
@@ -98,23 +110,23 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
 
             pattern++;
             patternLen--;
-            not = pattern[0] == '^';
+            not = patternLen && pattern[0] == '^';
             if (not) {
                 pattern++;
                 patternLen--;
             }
             match = 0;
             while(1) {
-                if (pattern[0] == '\\' && patternLen >= 2) {
+                if (patternLen >= 2 && pattern[0] == '\\') {
                     pattern++;
                     patternLen--;
                     if (pattern[0] == string[0])
                         match = 1;
-                } else if (pattern[0] == ']') {
-                    break;
                 } else if (patternLen == 0) {
                     pattern--;
                     patternLen++;
+                    break;
+                } else if (pattern[0] == ']') {
                     break;
                 } else if (patternLen >= 3 && pattern[1] == '-') {
                     int start = pattern[0];
@@ -175,7 +187,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
         pattern++;
         patternLen--;
         if (stringLen == 0) {
-            while(*pattern == '*') {
+            while(patternLen && *pattern == '*') {
                 pattern++;
                 patternLen--;
             }
@@ -187,10 +199,47 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
     return 0;
 }
 
+/* 
+ * glob-style pattern matching to check if a given pattern fully includes 
+ * the prefix of a string. For the match to succeed, the pattern must end with 
+ * an unescaped '*' character.
+ * 
+ * Returns: 1 if the `pattern` fully matches the `prefixStr`. Returns 0 otherwise.
+ */
+int prefixmatch(const char *pattern, int patternLen,
+                const char *prefixStr, int prefixStrLen, int nocase) {
+    int skipLongerMatches = 0;
+    
+    /* Step 1: Verify if the pattern matches the prefix string completely. */
+    if (!stringmatchlen_impl(pattern, patternLen, prefixStr, prefixStrLen, nocase, &skipLongerMatches, 0))
+        return 0;
+
+    /* Step 2: Verify that the pattern ends with an unescaped '*', indicating
+     * it can match any suffix of the string beyond the prefix. This check
+     * remains outside stringmatchlen_impl() to keep its complexity manageable.
+     */
+    if (patternLen == 0 || pattern[patternLen - 1] != '*' )
+        return 0;
+
+    /* Count backward the number of consecutive backslashes preceding the '*'
+     * to determine if the '*' is escaped. */
+    int backslashCount = 0;
+    for (int i = patternLen - 2; i >= 0; i--) {
+        if (pattern[i] == '\\')
+            ++backslashCount;
+        else
+            break; /* Stop counting when a non-backslash character is found. */
+    }
+
+    /* Return 1 if the '*' is not escaped (i.e., even count), 0 otherwise. */
+    return (backslashCount % 2 == 0);
+}
+
+/* Glob-style pattern matching to a string. */
 int stringmatchlen(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase) {
     int skipLongerMatches = 0;
-    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches);
+    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches,0);
 }
 
 int stringmatch(const char *pattern, const char *string, int nocase) {
@@ -273,6 +322,8 @@ unsigned long long memtoull(const char *p, int *err) {
         if (err) *err = 1;
         return 0;
     }
+    /* Clamp to ULLONG_MAX if the unit conversion overflows. */
+    if (val > ULLONG_MAX / mul) return ULLONG_MAX;
     return val*mul;
 }
 
@@ -612,13 +663,19 @@ int string2ld(const char *s, size_t slen, long double *dp) {
 int string2d(const char *s, size_t slen, double *dp) {
     errno = 0;
     char *eptr;
-    *dp = strtod(s, &eptr);
-    if (slen == 0 ||
-        isspace(((const char*)s)[0]) ||
-        (size_t)(eptr-(char*)s) != slen ||
+    /* Fast path to reject empty strings, or strings starting by space explicitly */
+    if (unlikely(slen == 0 ||
+        isspace(((const char*)s)[0])))
+        return 0;
+    *dp = fast_float_strtod(s, slen, &eptr);
+    /* Reject if not all characters were consumed by the parser. */
+    if (unlikely((size_t)(eptr - (char*)s) != slen)) {
+        return 0;
+    }
+    if (unlikely(errno == EINVAL ||
         (errno == ERANGE &&
             (*dp == HUGE_VAL || *dp == -HUGE_VAL || fpclassify(*dp) == FP_ZERO)) ||
-        isnan(*dp))
+        isnan(*dp)))
         return 0;
     return 1;
 }
@@ -979,7 +1036,7 @@ void getRandomHexChars(char *p, size_t len) {
  * case of one or more "../" appearing at the start of "filename"
  * relative path. */
 sds getAbsolutePath(char *filename) {
-    char cwd[1024];
+    char cwd[PATH_MAX + 1];
     sds abspath;
     sds relpath = sdsnew(filename);
 
@@ -1047,6 +1104,28 @@ int pathIsBaseName(char *path) {
     return strchr(path,'/') == NULL && strchr(path,'\\') == NULL;
 }
 
+char *getFileExtension(char *path) {
+    char *pch = strrchr(path,'.');
+    if (!pch)
+        return NULL;
+    else
+        return pch+1;
+}
+
+char *getFileBaseName(char *path) {
+    if (pathIsBaseName(path)) return path;
+
+    char *pch = strrchr(path,'/');
+    return pch+1;
+}
+
+sds getFilePath(char *path) {
+    if (pathIsBaseName(path)) return NULL;
+
+    char *pch = strrchr(path,'/');
+    return sdsnewlen(path, pch - path);
+}
+
 int fileExist(char *filename) {
     struct stat statbuf;
     return stat(filename, &statbuf) == 0 && S_ISREG(statbuf.st_mode);
@@ -1055,6 +1134,25 @@ int fileExist(char *filename) {
 int dirExists(char *dname) {
     struct stat statbuf;
     return stat(dname, &statbuf) == 0 && S_ISDIR(statbuf.st_mode);
+}
+
+/* Returns true when the directory is missing or contains no entries. */
+int dirIsEmpty(char *dname) {
+    DIR *dir;
+    struct dirent *entry;
+
+    if ((dir = opendir(dname)) == NULL) {
+        return errno == ENOENT;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        closedir(dir);
+        return 0;
+    }
+
+    closedir(dir);
+    return 1;
 }
 
 int dirCreateIfMissing(char *dname) {
@@ -1124,6 +1222,62 @@ sds makePath(char *path, char *filename) {
     return sdscatfmt(sdsempty(), "%s/%s", path, filename);
 }
 
+/* Copy source to a newly created destination and sync its contents. On error,
+ * remove any partial destination and return -1 with errno preserved. */
+int copyFile(char *source, char *destination) {
+    const size_t buf_size = 64 * 1024;
+    char *buf = zmalloc(buf_size);
+    int source_fd = -1, destination_fd = -1;
+    int destination_created = 0;
+    struct stat sb;
+    int ret = -1;
+    int error;
+
+    if ((source_fd = open(source, O_RDONLY)) == -1 ||
+        fstat(source_fd, &sb) == -1)
+    {
+        goto cleanup;
+    }
+
+    destination_fd = open(destination, O_WRONLY|O_CREAT|O_EXCL,
+                          sb.st_mode & 0777);
+    if (destination_fd == -1) goto cleanup;
+    destination_created = 1;
+
+    while (1) {
+        ssize_t nread = read(source_fd, buf, buf_size);
+        if (nread == 0) break;
+        if (nread == -1) {
+            if (errno == EINTR) continue;
+            goto cleanup;
+        }
+
+        ssize_t offset = 0;
+        while (offset < nread) {
+            ssize_t nwritten = write(destination_fd, buf + offset, nread - offset);
+            if (nwritten <= 0) {
+                if (errno == EINTR) continue;
+                if (nwritten == 0) errno = EIO;
+                goto cleanup;
+            }
+            offset += nwritten;
+        }
+    }
+
+    if (redis_fsync(destination_fd) == -1)
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    error = errno;
+    if (source_fd != -1) close(source_fd);
+    if (destination_fd != -1) close(destination_fd);
+    if (ret == -1 && destination_created) unlink(destination);
+    zfree(buf);
+    errno = error;
+    return ret;
+}
+
 /* Given the filename, sync the corresponding directory.
  *
  * Usually a portable and safe pattern to overwrite existing files would be like:
@@ -1176,7 +1330,10 @@ int fsyncFileDir(const char *filename) {
 int reclaimFilePageCache(int fd, size_t offset, size_t length) {
 #ifdef HAVE_FADVISE
     int ret = posix_fadvise(fd, offset, length, POSIX_FADV_DONTNEED);
-    if (ret) return -1;
+    if (ret) {
+        errno = ret;
+        return -1;
+    }
     return 0;
 #else
     UNUSED(fd);
@@ -1484,6 +1641,63 @@ static void test_string2l(void) {
 #endif
 }
 
+static void test_string2d(void) {
+    char buf[1024];
+    double v;
+
+    /* Valid hexadecimal value. */
+    redis_strlcpy(buf,"0x0p+0",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 1);
+    assert(v == 0.0);
+
+    redis_strlcpy(buf,"0x1p+0",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 1);
+    assert(v == 1.0);
+
+    /* Valid floating-point numbers */
+    redis_strlcpy(buf, "1.5", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 1.5);
+
+    redis_strlcpy(buf, "-3.14", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == -3.14);
+
+    redis_strlcpy(buf, "2.0e10", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 2.0e10);
+
+    redis_strlcpy(buf, "1e-3", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 0.001);
+
+    /* Valid integer */
+    redis_strlcpy(buf, "42", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 42.0);
+
+    /* Invalid cases */
+    /* Empty. */
+    redis_strlcpy(buf, "", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Starting by space. */
+    redis_strlcpy(buf, " 1.23", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Invalid hexadecimal format. */
+    redis_strlcpy(buf, "0x1.2g", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Hexadecimal NaN */
+    redis_strlcpy(buf, "0xNan", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* overflow. */
+    redis_strlcpy(buf,"23456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 0);
+}
+
 static void test_ll2string(void) {
     char buf[32];
     long long v;
@@ -1612,7 +1826,9 @@ static int cache_exist(int fd) {
 }
 
 static void test_reclaimFilePageCache(void) {
-    char *tmpfile = "/tmp/redis-reclaim-cache-test";
+    /* Use /var/tmp: /tmp may be tmpfs, where
+     * POSIX_FADV_DONTNEED does not evict file pages. */
+    char *tmpfile = "/var/tmp/redis-reclaim-cache-test";
     int fd = open(tmpfile, O_RDWR|O_CREAT, 0644);
     assert(fd >= 0);
 
@@ -1631,7 +1847,7 @@ static void test_reclaimFilePageCache(void) {
     assert(!cache_exist(fd));
 
     unlink(tmpfile);
-    printf("reclaimFilePageCach test is ok\n");
+    printf("reclaimFilePageCache test is ok\n");
 }
 #endif
 
@@ -1642,6 +1858,7 @@ int utilTest(int argc, char **argv, int flags) {
 
     test_string2ll();
     test_string2l();
+    test_string2d();
     test_ll2string();
     test_ld2string();
     test_fixedpoint_d2string();

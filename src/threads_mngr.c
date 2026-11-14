@@ -1,30 +1,10 @@
 /*
- * Copyright (c) 2021, Redis Ltd.
+ * Copyright (c) 2021-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "threads_mngr.h"
@@ -44,8 +24,8 @@ static const clock_t RUN_ON_THREADS_TIMEOUT = 2;
 
 /*================================= Globals ================================= */
 
-static run_on_thread_cb g_callback = NULL;
-static volatile size_t g_tids_len = 0;
+static redisAtomic run_on_thread_cb g_callback = NULL;
+static redisAtomic size_t g_tids_len = 0;
 static redisAtomic size_t g_num_threads_done = 0;
 
 /* This flag is set while ThreadsManager_runOnThreads is running */
@@ -83,15 +63,15 @@ int ThreadsManager_runOnThreads(pid_t *tids, size_t tids_len, run_on_thread_cb c
     }
 
     /* Update g_callback */
-    g_callback = callback;
+    atomicSet(g_callback, callback);
 
     /* Set g_tids_len */
-    g_tids_len = tids_len;
+    atomicSet(g_tids_len, tids_len);
 
     /* set g_num_threads_done to 0 To handler the case where in the previous run we reached the timeout
     and called ThreadsManager_cleanups before one or more threads were done and increased
     (the already set to 0) g_num_threads_done */
-    g_num_threads_done = 0;
+    atomicSet(g_num_threads_done, 0);
 
     /* Send signal to all the threads in tids */
     pid_t pid = getpid();
@@ -123,7 +103,9 @@ static int test_and_start(void) {
 __attribute__ ((noinline))
 static void invoke_callback(int sig) {
     UNUSED(sig);
-    run_on_thread_cb callback = g_callback;
+
+    run_on_thread_cb callback;
+    atomicGet(g_callback, callback);
     if (callback) {
         callback();
         atomicIncr(g_num_threads_done, 1);
@@ -142,6 +124,7 @@ static void wait_threads(void) {
     /* Wait until all threads are done to invoke the callback or until we reached the timeout */
     size_t curr_done_count;
     struct timespec curr_time;
+    size_t tids_len;
 
     do {
         struct timeval tv = {
@@ -152,7 +135,8 @@ static void wait_threads(void) {
         select(0, NULL, NULL, NULL, &tv);
         atomicGet(g_num_threads_done, curr_done_count);
         clock_gettime(CLOCK_REALTIME, &curr_time);
-    } while (curr_done_count < g_tids_len &&
+        atomicGet(g_tids_len, tids_len);
+    } while (curr_done_count < tids_len &&
              curr_time.tv_sec <= timeout_time.tv_sec);
 
     if (curr_time.tv_sec > timeout_time.tv_sec) {
@@ -162,9 +146,9 @@ static void wait_threads(void) {
 }
 
 static void ThreadsManager_cleanups(void) {
-    g_callback = NULL;
-    g_tids_len = 0;
-    g_num_threads_done = 0;
+    atomicSet(g_callback, NULL);
+    atomicSet(g_tids_len, 0);
+    atomicSet(g_num_threads_done, 0);
 
     /* Lastly, turn off g_in_progress */
     atomicSet(g_in_progress, 0);

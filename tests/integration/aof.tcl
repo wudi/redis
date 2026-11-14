@@ -4,9 +4,24 @@ set server_path [tmpdir server.aof]
 set aof_dirname "appendonlydir"
 set aof_basename "appendonly.aof"
 set aof_dirpath "$server_path/$aof_dirname"
-set aof_base_file "$server_path/$aof_dirname/${aof_basename}.1$::base_aof_sufix$::aof_format_suffix"
-set aof_file "$server_path/$aof_dirname/${aof_basename}.1$::incr_aof_sufix$::aof_format_suffix"
+set aof_base_file "$server_path/$aof_dirname/${aof_basename}.1$::base_aof_suffix$::aof_format_suffix"
+set aof_file "$server_path/$aof_dirname/${aof_basename}.1$::incr_aof_suffix$::aof_format_suffix"
 set aof_manifest_file "$server_path/$aof_dirname/$aof_basename$::manifest_suffix"
+
+# Every server in this unit is started with the same `dir $server_path`, and
+# start_server derives the server log path from `dir`, so all of them append to
+# one shared log. A log wait that starts from line 0 can therefore be satisfied
+# by a line logged by an *earlier* server in the unit rather than by the one
+# under test -- several of the patterns below are logged by more than one test.
+# That makes the assertion vacuous, and it can also end the block (tearing the
+# server down) while it is still starting up, leaving the AOF files in a state
+# the next test doesn't expect. So snapshot the end of the log right before
+# starting a server, and wait from there.
+#
+# The snapshot has to go in a global: start_server_aof[_ex] bridges only a few
+# names into the block body with upvar, so a local variable set out here would
+# not be visible inside it.
+set aof_stdout "$server_path/stdout"
 
 tags {"aof external:skip"} {
     # Server can start when aof-load-truncated is set to yes and AOF
@@ -73,9 +88,10 @@ tags {"aof external:skip"} {
         append_to_aof [formatCommand set foo hello]
     }
 
-    start_server_aof_ex [list dir $server_path aof-load-truncated yes] [list wait_ready false] {
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof_ex [list dir $server_path aof-load-truncated yes aof-load-corrupt-tail-max-size 0] [list wait_ready false] {
         test "Bad format: Server should have logged an error" {
-            wait_for_log_messages 0 {"*Bad file format reading the append only file*"} 0 10 1000
+            wait_for_log_messages 0 {"*Bad file format reading the append only file*"} $::aof_loglines 10 1000
         }
     }
 
@@ -86,9 +102,10 @@ tags {"aof external:skip"} {
         append_to_aof [formatCommand set bar world]
     }
 
+    set ::aof_loglines [count_file_lines $aof_stdout]
     start_server_aof_ex [list dir $server_path aof-load-truncated no] [list wait_ready false] {
         test "Unfinished MULTI: Server should have logged an error" {
-            wait_for_log_messages 0 {"*Unexpected end of file reading the append only file*"} 0 10 1000
+            wait_for_log_messages 0 {"*Unexpected end of file reading the append only file*"} $::aof_loglines 10 1000
         }
     }
 
@@ -98,9 +115,10 @@ tags {"aof external:skip"} {
         append_to_aof [string range [formatCommand set bar world] 0 end-1]
     }
 
+    set ::aof_loglines [count_file_lines $aof_stdout]
     start_server_aof_ex [list dir $server_path aof-load-truncated no] [list wait_ready false] {
         test "Short read: Server should have logged an error" {
-            wait_for_log_messages 0 {"*Unexpected end of file reading the append only file*"} 0 10 1000
+            wait_for_log_messages 0 {"*Unexpected end of file reading the append only file*"} $::aof_loglines 10 1000
         }
     }
 
@@ -208,7 +226,7 @@ tags {"aof external:skip"} {
         }
     }
 
-    start_server {overrides {appendonly {yes} appendfsync always}} {
+    start_server {tags {"tsan:skip"} overrides {appendonly {yes} appendfsync always}} {
         test {AOF fsync always barrier issue} {
             set rd [redis_deferring_client]
             # Set a sleep when aof is flushed, so that we have a chance to look
@@ -239,7 +257,7 @@ tags {"aof external:skip"} {
         }
     }
 
-    start_server {overrides {appendonly {yes}}} {
+    start_server {overrides {appendonly {yes} appendfsync always}} {
         test {GETEX should not append to AOF} {
             set aof [get_last_incr_aof_path r]
             r set foo bar
@@ -257,9 +275,10 @@ tags {"aof external:skip"} {
         append_to_aof [formatCommand set foo hello]
     }
 
+    set ::aof_loglines [count_file_lines $aof_stdout]
     start_server_aof_ex [list dir $server_path aof-load-truncated yes] [list wait_ready false] {
         test "Unknown command: Server should have logged an error" {
-            wait_for_log_messages 0 {"*Unknown command 'bla' reading the append only file*"} 0 10 1000
+            wait_for_log_messages 0 {"*Unknown command 'bla' reading the append only file*"} $::aof_loglines 10 1000
         }
     }
 
@@ -374,6 +393,35 @@ tags {"aof external:skip"} {
         }
     }
 
+    test {skip EXEC ACL check during AOF load} {
+        set user_acl "default on nopass ~* &* +@read -@write +multi +exec +select +ping"
+
+        create_aof_manifest $aof_dirpath $aof_manifest_file {
+            append_to_manifest "file appendonly.aof.1.incr.aof seq 1 type i\n"
+        }
+
+        create_aof $aof_dirpath $aof_file {
+            append_to_aof [formatCommand set beforetx beforetx]
+            append_to_aof [formatCommand multi]
+            append_to_aof [formatCommand set tx1 tx1]
+            append_to_aof [formatCommand set tx2 tx2]
+            append_to_aof [formatCommand exec]
+            append_to_aof [formatCommand set aftertx aftertx]
+        }
+
+        start_server_aof [list dir $server_path user $user_acl] {
+            set c [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $c
+            assert_equal {beforetx} [$c get beforetx]
+            assert_equal {aftertx}  [$c get aftertx]
+            assert_equal {tx1} [$c get tx1]
+            assert_equal {tx2} [$c get tx2]
+
+            catch {$c set newkey value} e
+            assert_match {*NOPERM*set*} $e
+        }
+    }
+
     # redis could load AOF which has timestamp annotations inside
     create_aof $aof_dirpath $aof_file {
         append_to_aof "#TS:1628217470\r\n"
@@ -439,6 +487,7 @@ tags {"aof external:skip"} {
                 append_to_aof [formatCommand eval {redis.call('set',KEYS[1],'y'); for i=1,1500000 do redis.call('ping') end return 'ok'} 1 x]
             }
             set rd [redis_deferring_client]
+            set loglines [count_log_lines 0]
             $rd debug loadaof
             $rd flush
             wait_for_condition 100 10 {
@@ -449,7 +498,7 @@ tags {"aof external:skip"} {
             assert_error {LOADING*} {r ping}
             $rd read
             $rd close
-            wait_for_log_messages 0 {"*Slow script detected*"} 0 100 100
+            wait_for_log_messages 0 {"*Slow script detected*"} $loglines 100 100
             assert_equal [r get x] y
         }
     }
@@ -473,6 +522,18 @@ tags {"aof external:skip"} {
         create_aof $aof_dirpath $aof_file {
             append_to_aof [formatCommand set foo hello]
             append_to_aof [formatCommand set bar world]
+        }
+
+        catch {
+            exec src/redis-check-aof $aof_file
+        } result
+        assert_match "*Start checking Old-Style AOF*is valid*" $result
+    }
+
+    test {Test redis-check-aof for old style resp AOF - has data in the same format as manifest} {
+        create_aof $aof_dirpath $aof_file {
+            append_to_aof [formatCommand set file file]
+            append_to_aof [formatCommand set "file appendonly.aof.2.base.rdb seq 2 type b" "file appendonly.aof.2.base.rdb seq 2 type b"]
         }
 
         catch {
@@ -527,6 +588,19 @@ tags {"aof external:skip"} {
             exec src/redis-check-aof $aof_manifest_file
         } result
         assert_match "*Start checking Multi Part AOF*Start to check BASE AOF (RDB format)*DB preamble is OK, proceeding with AOF tail*BASE AOF*is valid*Start to check INCR files*INCR AOF*is valid*All AOF files and manifest are valid*" $result
+    }
+
+    test {Test redis-check-aof for Multi Part AOF contains a format error} {
+        create_aof_manifest $aof_dirpath $aof_manifest_file {
+            append_to_manifest "file appendonly.aof.1.base.aof seq 1 type b\n"
+            append_to_manifest "file appendonly.aof.1.incr.aof seq 1 type i\n"
+            append_to_manifest "!!!\n"
+        }
+
+        catch {
+            exec src/redis-check-aof $aof_manifest_file
+        } result
+        assert_match "*Invalid AOF manifest file format*" $result
     }
 
     test {Test redis-check-aof only truncates the last file for Multi Part AOF in fix mode} {
@@ -628,6 +702,272 @@ tags {"aof external:skip"} {
                 {flushall}
                 {flushall}
             }
+        }
+    }
+
+    start_server {overrides {loading-process-events-interval-bytes 1024}} {
+        test "Allow changing appendonly config while loading from AOF on startup" {
+            # Set AOF enabled, populate db and restart.
+            r config set appendonly yes
+            r config set key-load-delay 100
+            r config rewrite
+            populate 10000
+            restart_server 0 false false
+
+            # Disable AOF while loading from the disk.
+            assert_equal 1 [s loading]
+            r config set appendonly no
+            assert_equal 1 [s loading]
+
+            # Speed up loading, verify AOF disabled.
+            r config set key-load-delay 0
+            wait_done_loading r
+            assert_equal {10000} [r dbsize]
+            assert_equal 0 [s aof_enabled]
+        }
+
+        test "Allow changing appendonly config while loading from RDB on startup" {
+            # Set AOF disabled, populate db and restart.
+            r flushall
+            r config set appendonly no
+            r config set key-load-delay 100
+            r config rewrite
+            populate 10000
+            r save
+            restart_server 0 false false
+
+            # Enable AOF while loading from the disk.
+            assert_equal 1 [s loading]
+            r config set appendonly yes
+            assert_equal 1 [s loading]
+
+            # Speed up loading, verify AOF enabled, do a quick sanity.
+            r config set key-load-delay 0
+            wait_done_loading r
+            assert_equal {10000} [r dbsize]
+            assert_equal 1 [s aof_enabled]
+            r set t 1
+            assert_equal {1} [r get t]
+        }
+    }
+
+    # Check AOF load broken behavior
+    # Corrupted base AOF, existing AOF files
+    create_aof $aof_dirpath $aof_base_file {
+        append_to_aof [formatCommand set param ok]
+        append_to_aof "corruption"
+    }
+    create_aof $aof_dirpath $aof_file {
+        append_to_aof [formatCommand set foo hello]
+    }
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof_ex [list dir $server_path aof-load-corrupt-tail-max-size 4096] [list wait_ready false] {
+        # The corrupt tail is recovered, but the BASE is not the last file, so
+        # the server still refuses to start. wait_for_log_messages matches any
+        # one of the patterns it is given, so assert the two lines separately.
+        test "Corrupted base AOF (not the last file): should fail" {
+            wait_for_log_messages 0 {
+                {*AOF*loaded anyway because aof-load-corrupt-tail-max-size is enabled*}
+            } $::aof_loglines 10 1000
+            wait_for_log_messages 0 {
+                {*Fatal error: the truncated file is not the last file*}
+            } $::aof_loglines 10 1000
+        }
+    }
+
+    # Now make the corrupt base file the last file. The server above already
+    # truncated the corrupt tail off it in place, so re-create the corruption,
+    # and drop the INCR file from the dir *and* from the manifest -- a file
+    # listed in the manifest but missing on disk is a fatal error.
+    create_aof $aof_dirpath $aof_base_file {
+        append_to_aof [formatCommand set param ok]
+        append_to_aof "corruption"
+    }
+    exec rm -f $aof_file
+    create_aof_manifest $aof_dirpath $aof_manifest_file {
+        append_to_manifest "file appendonly.aof.1.base.aof seq 1 type b\n"
+    }
+    start_server_aof [list dir $server_path aof-load-corrupt-tail-max-size 4096] {
+        test "Corrupted base AOF (last file): should recover" {
+            assert_equal 1 [is_alive [srv pid]]
+        }
+
+        test "param should be 'ok'" {
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            assert {[$client get param] eq "ok"}
+        }
+    }
+
+    # Should also start with broken incr AOF. The block above left a BASE-only
+    # manifest, so list the INCR file in it again.
+    create_aof_manifest $aof_dirpath $aof_manifest_file {
+        append_to_manifest "file appendonly.aof.1.base.aof seq 1 type b\n"
+        append_to_manifest "file appendonly.aof.1.incr.aof seq 1 type i\n"
+    }
+    create_aof $aof_dirpath $aof_file {
+        append_to_aof [formatCommand set foo 1]
+        append_to_aof [formatCommand incr foo]
+        append_to_aof [formatCommand incr foo]
+        append_to_aof [formatCommand incr foo]
+        append_to_aof [formatCommand incr foo]
+        append_to_aof "corruption"
+    }
+
+    start_server_aof [list dir $server_path aof-load-corrupt-tail-max-size 4096] {
+        test "Short read: Server should start if aof-load-broken is yes" {
+            assert_equal 1 [is_alive [srv pid]]
+        }
+
+        # The AOF file is expected to be correct because aof-load-corrupt-tail-max-size is set to 4096,
+        # so the AOF will reload without the corruption
+        test "Broken AOF loaded: we expect foo to be equal to 5" {
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            assert {[$client get foo] eq "5"}
+        }
+
+        test "Append a new command after loading an incomplete AOF" {
+            $client incr foo
+        }
+    }
+
+    start_server_aof [list dir $server_path aof-load-corrupt-tail-max-size 4096] {
+        test "Short read + command: Server should start" {
+            assert_equal 1 [is_alive [srv pid]]
+        }
+
+        test "Broken AOF loaded: we expect foo to be equal to 6 now" {
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            assert {[$client get foo] eq "6"}
+        }
+    }
+
+    # Test that the server exits when the AOF contains a format error
+    create_aof $aof_dirpath $aof_file {
+        append_to_aof [formatCommand set foo hello]
+        append_to_aof [string range [formatCommand incr foo] 0 end-3]
+        append_to_aof "corruption"
+    }
+
+    # We set the maximum allowed corrupted size to 2 bytes, but the actual corrupted portion is larger,
+    # so the AOF file will not be reloaded.
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof_ex [list dir $server_path aof-load-corrupt-tail-max-size 2] [list wait_ready false] {
+        test "Bad format: Server should have logged an error" {
+            wait_for_log_messages 0 {"*Bad file format reading the append only file*aof-load-corrupt-tail-max-size*"} $::aof_loglines 10 1000
+        }
+    }
+
+    create_aof_manifest $aof_dirpath $aof_manifest_file {
+        append_to_manifest "file appendonly.aof.1.base.aof seq 1 type b\n"
+        append_to_manifest "file appendonly.aof.1.incr.aof seq 1 type i\n"
+        append_to_manifest "file appendonly.aof.2.incr.aof seq 2 type i\n"
+    }
+    # Create base AOF file
+    set base_aof_file "$aof_dirpath/appendonly.aof.1.base.aof"
+    create_aof $aof_dirpath $base_aof_file {
+        append_to_aof [formatCommand set fo base]
+    }
+
+    # Create middle incr AOF file with corruption
+    set mid_aof_file "$aof_dirpath/appendonly.aof.1.incr.aof"
+    create_aof $aof_dirpath $mid_aof_file {
+        append_to_aof [formatCommand set fo mid]
+        append_to_aof "CORRUPTION"
+    }
+
+    # Create last incr AOF file (valid)
+    set last_aof_file "$aof_dirpath/appendonly.aof.2.incr.aof"
+    create_aof $aof_dirpath $last_aof_file {
+        append_to_aof [formatCommand set fo last]
+    }
+
+    # Check that Redis fails to load because corruption is in the middle file
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof_ex [list dir $server_path aof-load-corrupt-tail-max-size 4096] [list wait_ready false] {
+        test "Intermediate AOF is broken: should recover successfully" {
+            wait_for_log_messages 0 {
+                {*AOF*loaded anyway because aof-load-corrupt-tail-max-size is enabled*}
+            } $::aof_loglines 10 1000
+        }
+    }
+
+    # Swap mid and last files
+    set tmp_file "$aof_dirpath/temp.aof"
+    file rename -force $mid_aof_file $tmp_file
+    file rename -force $last_aof_file $mid_aof_file
+    file rename -force $tmp_file $last_aof_file
+
+    # The server above truncated the corruption off the mid file in place
+    # before failing, so re-create it, now in the last file.
+    create_aof $aof_dirpath $last_aof_file {
+        append_to_aof [formatCommand set fo mid]
+        append_to_aof "CORRUPTION"
+    }
+
+    # Should now start successfully since corruption is in last AOF file
+    start_server_aof [list dir $server_path aof-load-corrupt-tail-max-size 4096] {
+        test "Corrupted last AOF file: Server should still start and recover" {
+            assert_equal 1 [is_alive [srv pid]]
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            assert {[$client get fo] eq "mid"}
+        }
+    }
+
+    # Test corrupt tail recovery with realistic corruption scenario
+    # Create corruption in the LAST file instead of middle file
+    set last_aof_file "$aof_dirpath/appendonly.aof.2.incr.aof"
+    create_aof $aof_dirpath $last_aof_file {
+        append_to_aof [formatCommand set foo 5]
+        append_to_aof "!!!"
+        append_to_aof [formatCommand set foo 3]
+    }
+
+    # aof-load-corrupt-tail-max-size has to be disabled here: this server is
+    # expected to fail on the corrupt tail and leave the file alone, both for
+    # its own assertion and so that the next server still has something to
+    # recover.
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof_ex [list dir $server_path aof-load-truncated yes aof-load-corrupt-tail-max-size 0] [list wait_ready false] {
+        test "Bad format: Server should have logged an error" {
+            wait_for_log_messages 0 {"*Bad file format reading the append only file*"} $::aof_loglines 10 1000
+        }
+    }
+
+    set ::aof_loglines [count_file_lines $aof_stdout]
+    start_server_aof [list dir $server_path aof-load-corrupt-tail-max-size 64] {
+        test "Corrupt tail: Server should start if aof-load-corrupt-tail-max-size is set" {
+            assert_equal 1 [is_alive [srv pid]]
+        }
+
+        test "Corrupt tail: Server should have logged warning" {
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            wait_for_log_messages 0 {"*corrupt AOF file tail*"} $::aof_loglines 10 1000
+        }
+
+        test "Corrupt tail: we expect foo to be equal to 5" {
+            assert {[$client get foo] eq "5"}
+        }
+
+        test "Append a new command after loading an incomplete AOF" {
+            $client incr foo
+        }
+    }
+
+    # Now the AOF file is expected to be correct
+    start_server_aof [list dir $server_path] {
+        test "Corrupt tail + command: Server should start" {
+            assert_equal 1 [is_alive [srv pid]]
+        }
+
+        test "Corrupt tail: we expect foo to be equal to 6 now" {
+            set client [redis [srv host] [srv port] 0 $::tls]
+            wait_done_loading $client
+            assert {[$client get foo] eq "6"}
         }
     }
 }

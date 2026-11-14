@@ -38,7 +38,53 @@ int set_aclcheck_key(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
         return REDISMODULE_OK;
     }
 
-    RedisModuleCallReply *rep = RedisModule_Call(ctx, "SET", "v", argv + 2, argc - 2);
+    RedisModuleCallReply *rep = RedisModule_Call(ctx, "SET", "v", argv + 2, (size_t)argc - 2);
+    if (!rep) {
+        RedisModule_ReplyWithError(ctx, "NULL reply returned");
+    } else {
+        RedisModule_ReplyWithCallReply(ctx, rep);
+        RedisModule_FreeCallReply(rep);
+    }
+
+    RedisModule_FreeModuleUser(user);
+    RedisModule_FreeString(ctx, user_name);
+    return REDISMODULE_OK;
+}
+
+/* A wrap for SET command with ACL check on the key. */
+int set_aclcheck_prefixkey(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
+    if (argc < 4) {
+        return RedisModule_WrongArity(ctx);
+    }
+
+    int permissions;
+    const char *flags = RedisModule_StringPtrLen(argv[1], NULL);
+
+    if (!strcasecmp(flags, "W")) {
+        permissions = REDISMODULE_CMD_KEY_UPDATE;
+    } else if (!strcasecmp(flags, "R")) {
+        permissions = REDISMODULE_CMD_KEY_ACCESS;
+    } else if (!strcasecmp(flags, "*")) {
+        permissions = REDISMODULE_CMD_KEY_UPDATE | REDISMODULE_CMD_KEY_ACCESS;
+    } else if (!strcasecmp(flags, "~")) {
+        permissions = 0; /* Requires either read or write */
+    } else {
+        RedisModule_ReplyWithError(ctx, "INVALID FLAGS");
+        return REDISMODULE_OK;
+    }
+
+    /* Check that the key can be accessed */
+    RedisModuleString *user_name = RedisModule_GetCurrentUserName(ctx);
+    RedisModuleUser *user = RedisModule_GetModuleUserFromUserName(user_name);
+    int ret = RedisModule_ACLCheckKeyPrefixPermissions(user, argv[2], permissions);
+    if (ret != 0) {
+        RedisModule_ReplyWithError(ctx, "DENIED KEY");
+        RedisModule_FreeModuleUser(user);
+        RedisModule_FreeString(ctx, user_name);
+        return REDISMODULE_OK;
+    }
+
+    RedisModuleCallReply *rep = RedisModule_Call(ctx, "SET", "v", argv + 3, (size_t)argc - 3);
     if (!rep) {
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     } else {
@@ -68,7 +114,7 @@ int publish_aclcheck_channel(RedisModuleCtx *ctx, RedisModuleString **argv, int 
         return REDISMODULE_OK;
     }
 
-    RedisModuleCallReply *rep = RedisModule_Call(ctx, "PUBLISH", "v", argv + 1, argc - 1);
+    RedisModuleCallReply *rep = RedisModule_Call(ctx, "PUBLISH", "v", argv + 1, (size_t)argc - 1);
     if (!rep) {
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     } else {
@@ -98,7 +144,7 @@ int rm_call_aclcheck_cmd(RedisModuleCtx *ctx, RedisModuleUser *user, RedisModule
 
     const char* cmd = RedisModule_StringPtrLen(argv[1], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "v", argv + 2, argc - 2);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "v", argv + 2, (size_t)argc - 2);
     if(!rep){
         RedisModule_ReplyWithError(ctx, "NULL reply returned");
     }else{
@@ -146,7 +192,7 @@ int rm_call_aclcheck_with_errors(RedisModuleCtx *ctx, RedisModuleString **argv, 
 
     const char* cmd = RedisModule_StringPtrLen(argv[1], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "vEC", argv + 2, argc - 2);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "vEC", argv + 2, (size_t)argc - 2);
     RedisModule_ReplyWithCallReply(ctx, rep);
     RedisModule_FreeCallReply(rep);
     return REDISMODULE_OK;
@@ -163,7 +209,7 @@ int rm_call_aclcheck(RedisModuleCtx *ctx, RedisModuleString **argv, int argc){
 
     const char* cmd = RedisModule_StringPtrLen(argv[1], NULL);
 
-    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "vC", argv + 2, argc - 2);
+    RedisModuleCallReply* rep = RedisModule_Call(ctx, cmd, "vC", argv + 2, (size_t)argc - 2);
     if(!rep) {
         char err[100];
         switch (errno) {
@@ -246,6 +292,9 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_CreateCommand(ctx,"aclcheck.set.check.key", set_aclcheck_key,"write",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
+
+    if (RedisModule_CreateCommand(ctx,"aclcheck.set.check.prefixkey", set_aclcheck_prefixkey,"write",0,0,0) == REDISMODULE_ERR)
+        return REDISMODULE_ERR;    
 
     if (RedisModule_CreateCommand(ctx,"block.commands.outside.onload", commandBlockCheck,"write",0,0,0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;

@@ -73,7 +73,7 @@ start_server {
     set result [create_random_dataset 16 lpush]
     test "SORT GET #" {
         assert_equal [lsort -integer $result] [r sort tosort GET #]
-    } {} {cluster:skip}
+    }
 
 foreach command {SORT SORT_RO} {
     test "$command GET <const>" {
@@ -184,6 +184,36 @@ foreach command {SORT SORT_RO} {
         } 1 zset
     } {{a c e b d} {d b e c a}}
 
+    foreach enc {listpack btree} {
+        set orig [config_get_set zset-max-listpack-entries [expr {$enc eq "listpack" ? 128 : 0}]]
+        test "SORT and SORT_RO sorted set preserve encoding ($enc)" {
+            r del zset
+            r zadd zset 1 a 5 b 2 c 10 d 3 e
+            assert_encoding $enc zset
+            foreach command {SORT SORT_RO} {
+                assert_equal {e d c b a} [r $command zset alpha desc]
+                assert_equal {a c e b d} [r $command zset by nosort asc]
+                assert_equal {d b e c a} [r $command zset by nosort desc]
+                assert_equal {c e} [r $command zset by nosort asc limit 1 2]
+                assert_equal {b e} [r $command zset by nosort desc limit 1 2]
+                assert_equal {} [r $command zset by nosort limit 5 10]
+                assert_encoding $enc zset
+            }
+
+            # Members that look like integers are stored as integers in a listpack.
+            r del zset
+            r zadd zset 1 10 5 3 2 2 10 -1 3 100
+            assert_encoding $enc zset
+            foreach command {SORT SORT_RO} {
+                assert_equal {-1 2 3 10 100} [r $command zset]
+                assert_equal {100 10 3 2 -1} [r $command zset desc]
+                assert_equal {10 2 100 3 -1} [r $command zset by nosort asc]
+                assert_encoding $enc zset
+            }
+        }
+        r config set zset-max-listpack-entries $orig
+    }
+
     test "SORT sorted set: +inf and -inf handling" {
         r del zset
         r zadd zset -100 a
@@ -203,6 +233,14 @@ foreach command {SORT SORT_RO} {
         }
         assert_equal [lsort -real $floats] [r sort mylist]
     }
+
+    test "SORT BY with smallest normal double 2.2250738585072012e-308" {
+        r flushdb
+        r lpush mylist a b
+        r set weight_a 2.2250738585072012e-308
+        r set weight_b 1
+        assert_equal {a b} [r sort mylist BY weight_*]
+    } {} {cluster:skip}
 
     test "SORT with STORE returns zero if result is empty (github issue 224)" {
         r flushdb
@@ -356,6 +394,18 @@ foreach command {SORT SORT_RO} {
             }
         }
     }
+
+    test {SORT STORE quicklist with the right options} {
+        set origin_config [config_get_set list-max-listpack-size -1]
+        r del lst{t} lst_dst{t}
+        r config set list-max-listpack-size -1
+        r config set list-compress-depth 12
+        r lpush lst{t} {*}[split [string repeat "1" 6000] ""]
+        r sort lst{t} store lst_dst{t}
+        assert_encoding quicklist lst_dst{t}
+        assert_match "*ql_listpack_max:-1 ql_compressed:1*" [r debug object lst_dst{t}]
+        config_set list-max-listpack-size $origin_config
+    } {} {needs:debug}
 }
 
 start_cluster 1 0 {tags {"external:skip cluster sort"}} {
@@ -381,6 +431,11 @@ start_cluster 1 0 {tags {"external:skip cluster sort"}} {
         r sort "{a}mylist" by "{a}by*" get "{a}get*"
     } {30 200 100}
 
+    test "sort get # in cluster mode" {
+        assert_equal [r sort "{a}mylist" by "{a}by*" get # ] {3 1 2}
+        r sort "{a}mylist" by "{a}by*" get "{a}get*" get #
+    } {30 3 200 1 100 2}
+
     test "sort_ro by in cluster mode" {
         catch {r sort_ro "{a}mylist" by by*} e
         assert_match {ERR BY option of SORT denied in Cluster mode when *} $e
@@ -392,4 +447,9 @@ start_cluster 1 0 {tags {"external:skip cluster sort"}} {
         assert_match {ERR GET option of SORT denied in Cluster mode when *} $e
         r sort_ro "{a}mylist" by "{a}by*" get "{a}get*"
     } {30 200 100}
+
+    test "sort_ro get # in cluster mode" {
+        assert_equal [r sort_ro "{a}mylist" by "{a}by*" get # ] {3 1 2}
+        r sort_ro "{a}mylist" by "{a}by*" get "{a}get*" get #
+    } {30 3 200 1 100 2}
 }
